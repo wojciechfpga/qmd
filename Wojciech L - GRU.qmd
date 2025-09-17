@@ -1,0 +1,682 @@
+---
+title: "RNN- GRU"
+author: "Wojciech L."
+format: html
+editor: visual
+---
+
+## Traffic forecasting using RNN networks - GRU
+
+Using GRU to Predict Traffic Volumes Based on Historical Data
+
+## Loading libraries
+
+The first step is to load the libraries so that you don't have to do it in the next parts of the code.
+
+```{r}
+#| message: false
+#| warning: false
+library(torch)
+library(timeSeriesDataSets)
+library(DT)
+library(tsibble)
+library(dplyr)
+library(tidyr)
+library(tidymodels)
+library(lubridate)
+library(slider)
+library(ggplot2)
+library(yardstick)
+library(pROC)
+library(gridExtra)
+library(progress)
+```
+
+## Initial data exploration
+
+The first step is to load the dataset
+
+```{r}
+data("pedestrian_tbl_ts", package = "timeSeriesDataSets")
+```
+
+#### First five rows of data
+
+Preliminary inspection of the data
+
+```{r}
+#| echo: false
+datatable(head(pedestrian_tbl_ts), caption = "First 6 rows of pedestrian_tbl_ts")
+```
+
+Next, the resulting dataset selects rows containing traffic from one of the measurement stations. The Birrarung Marr measuring station will be selected. The redundant column is removed.
+
+```{r}
+tsa_df <- pedestrian_tbl_ts %>%
+  filter(Sensor == "Birrarung Marr") %>%
+  select(-Sensor)
+```
+
+Converting to tibble
+
+```{r}
+tsa_df <- as_tibble(tsa_df)
+```
+
+Displaying a histogram to later split the rows while maintaining the balance of the classes
+
+```{r}
+ggplot(tsa_df, aes(x = Count)) +
+  geom_histogram(binwidth = 10, color = "red", fill = "skyblue")+
+  labs(title = "Histogram of count",
+       subtitle = "Column - Count",
+       x = "Count",
+       y = " Number of occurence",
+       caption ="Source - pedestrian_tbl_ts dataset")+
+  theme_gray()
+```
+
+It is clear that there are numerous outliers in the data
+
+## Initial data preprocessing
+
+At this stage, the data will be converted into a form that can be converted into numerical data.
+
+### NA values removing
+
+```{r}
+tsa_df <- tsa_df %>%
+  drop_na(Count, Date_Time)
+```
+
+### Splitting data by Count
+
+A new column will be created - traffic class - which will reflect the scale of traffic.
+
+Three classes will be created based on its Count value:
+
+-   1 - up to 112
+-   2 - between 112 and 470
+-   3 - larger then 470
+
+The numerical ranges were prepared based on the histogram
+
+```{r}
+tsa_df <- tsa_df %>% 
+  mutate(traffic_class = case_when(
+    Count < 112 ~1,
+    Count >= 112 & Count < 470 ~2,
+    Count >= 470 ~ 3,
+  ))
+```
+
+Based on the histogram of the new column, you can assess whether there is a numerical balance between the individual classes.
+
+```{r}
+
+
+ggplot(tsa_df, aes(x = traffic_class)) +
+  geom_bar(fill = "red")+
+  labs(title = "Histogram of count",
+       subtitle = "Column - Count",
+       x = "traffic_class value",
+       y = " Number of occurence",
+       caption ="Source - tsa_df")
+```
+
+It's clear that the classes are divided more or less evenly. If there were no numerical balance between the classes and one class were numerically dominant, the model could learn to adapt to it.
+
+### Removing unnecessary columns
+
+Based on data specificity and requirements, a number of columns have been removed.
+
+```{r}
+tsa_df <- tsa_df %>%
+  select(-Date, -Time, -Count)
+```
+
+## Data transformation
+
+In this section, we will convert the data into a form suitable for a Deep Learning model.
+
+### Cyclical encoding
+
+Cyclic coding aims to better represent features over repeated periods of time.
+
+We are creating a series of new columns that will contain both classically encoded date values and cyclical encoding. Cyclical encoding is intended to avoid situations, for example, when 11 p.m. is numerically far from 1 a.m.
+
+```{r}
+tsa_df <- tsa_df %>%
+  mutate(
+    hour = hour(Date_Time),
+    dow  = wday(Date_Time, week_start = 1) - 1,
+    doy  = yday(Date_Time),
+    
+    hour_sin = sin(2 * pi * hour / 24),
+    hour_cos = cos(2 * pi * hour / 24),
+    
+    dow_sin = sin(2 * pi * dow / 7),
+    dow_cos = cos(2 * pi * dow / 7),
+    
+    doy_sin = sin(2 * pi * doy / 365),
+    doy_cos = cos(2 * pi * doy / 365),
+    
+    t = row_number()
+  ) %>%
+  select(-Date_Time)
+
+
+```
+
+## Final data preparation
+
+In this chapter, we will convert data that is already in numerical form
+
+### Quick insight into data
+
+Before any transformations are made, a brief overview of the data will be performed.
+
+```{r}
+#| echo: false
+datatable(head(tsa_df), caption = "First 6 rows of tsa_df")
+```
+
+### Data preprocessing using tidymodels
+
+The tidymodels package will be used to transform the data in a standard way—via a recipe. The first step is to tell the recipe function that we want to predict traffic_class based on the remaining columns.
+
+The next step is to remove correlated columns – this eliminates columns that duplicate information.
+
+Next, we normalize the data – this simplifies the model's performance.
+
+The prep and bake functions are necessary to convert a recipe into a data frame.
+
+```{r}
+tsa_df <- recipes::recipe(traffic_class ~ ., data = tsa_df) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.9) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  prep() %>%
+  bake(new_data = NULL)
+```
+
+Let's check a result of preparing data using recipe
+
+```{r}
+#| echo: false
+datatable(head(tsa_df), caption = "First 6 rows of tsa_df")
+```
+
+## Splitting the dataset into predictors and labels
+
+The first step is to extract the values on the basis of which the prediction will be made.
+
+```{r}
+tsa_df_X <- tsa_df %>%
+  select(-traffic_class)
+```
+
+Next step is to define size of window
+
+```{r}
+window_size <- 24
+```
+
+Below is the code - the slide function - which creates a list of consecutive time sequences, shifted relative to each other by one. The example below shows the obtained list of sequences
+
+```{mermaid}
+flowchart TB
+    subgraph Windows["X - window_size = 3"]
+        W1["Window 1 = (1,2,3)"]
+        W2["Window 2 = (2,3,4)"]
+        W3["Window 3 = (3,4,5)"]
+    end
+```
+
+The slider function from the slider package allows you to easily create such a list of time windows.
+
+```{r}
+X <- slide(
+  .x = tsa_df_X,
+  .f = ~ .x,
+  .before = window_size - 1,
+  .complete = TRUE
+)
+```
+
+To remove initial missing values - .complete = TRUE - use list filtering
+
+```{r}
+X <- X[!sapply(X, is.null)]
+```
+
+Then we calculate the labels - we create a set with a vector from the window size to the end of the length of the set of values.
+
+```{mermaid}
+flowchart TB
+    subgraph Windows["y - labels"]
+        W1["Window 1 = (1,2,3) → y=4"]
+        W2["Window 2 = (2,3,4) → y=5"]
+        W3["Window 3 = (3,4,5) → y=6"]
+    end
+```
+
+We point to the traffic_class column and perform filtering
+
+```{r}
+y <- tsa_df$traffic_class[(window_size + 1):nrow(tsa_df)]
+```
+
+## Splitting the dataset into training and test
+
+The first step is to find the row number that represents half of the available data set. The data will be split 50/50 rather than 80/20 due to the specific nature of the problem – data repetitiveness.
+
+```{r}
+number_of_rows <- round(length(X)/2)
+```
+
+Having the row number, it is possible to divide the data in the assumed proportion
+
+```{r}
+X_training <- X[1:number_of_rows]
+X_testing <- X[number_of_rows:length(X)]
+
+y_training <- y[1:number_of_rows]
+y_testing <- y[number_of_rows:length(X)]
+```
+
+## Conversion to tensors
+
+Conversion to tensors is necessary for the torch for R model to accept the data correctly
+
+```{r}
+n_train <- length(X_training)
+n_test  <- length(X_testing)
+```
+
+At first - create arrays, which can then be easily converted to tensors. To do this, transform the list with time windows into matrices—removing the redundant column descriptions. Then, convert the list into "glued" matrices, which were previously list elements.
+
+```{r}
+X_train_arr <- array(
+  unlist(lapply(X_training, function(x) as.matrix(x))),
+  dim = c(window_size, n_train, ncol(tsa_df_X))
+)
+
+X_test_arr <- array(
+  unlist(lapply(X_testing, function(x) as.matrix(x))),
+  dim = c(window_size, n_test, ncol(tsa_df_X))
+)
+```
+
+Tensors based on previously obtained arrays.
+
+```{r}
+X_train_tensor <- torch_tensor(X_train_arr, dtype = torch_float())
+X_test_tensor  <- torch_tensor(X_test_arr,  dtype = torch_float())
+```
+
+Conversion tensor to RNN-GRU required dimensions - (length, batch_size, num_of_features).
+
+```{r}
+X_train_tensor <- X_train_tensor$permute(c(2, 1, 3))  #
+X_test_tensor  <- X_test_tensor$permute(c(2, 1, 3))
+```
+
+Obtaining a set of labels - converting DF to a vector and then unifying the type
+
+```{r}
+y_train_tensor <- torch_tensor(as.numeric(y_training), dtype = torch_float())
+y_test_tensor  <- torch_tensor(as.numeric(y_testing),  dtype = torch_float())
+```
+
+## Create dataset and dataloader
+
+It is necessary to create a dataloader based on the dataset. Training on one large batch can cause overtraining.
+
+```{r}
+ped_dataset <- dataset(
+  initialize = function(X, y) {
+    self$X <- X
+    self$y <- y
+  },
+  .getitem = function(i) {
+    x_i <- self$X[i, , ]   # (seq_len, input_size)
+    y_i <- self$y[i]
+    list(x = x_i, y = y_i)
+  },
+  .length = function() {
+    self$y$size()[[1]]
+  }
+)
+
+```
+
+A dataset instance is created - it is used to create a dataloader
+
+```{r}
+train_ds <- ped_dataset(X_train_tensor, y_train_tensor)
+test_ds  <- ped_dataset(X_test_tensor, y_test_tensor)
+```
+
+Finally, dataloader instances are created
+
+```{r}
+train_dl <- dataloader(train_ds, batch_size = 512, shuffle = FALSE)
+test_dl  <- dataloader(test_ds, batch_size = 64, shuffle = FALSE)
+```
+
+## GRU Deep Learning model instance
+
+A GRU-based RNN module class is created. Layers are declared as attributes and data flow is defined in the forward function.
+
+```{r}
+GRUModel <- nn_module(
+  "GRUModel",
+  
+  initialize = function(input_size, hidden_size, num_layers = 2, num_classes = 10,   dropout_p = 0.2) {
+     
+    self$gru <- nn_gru(
+      input_size = input_size,
+      hidden_size = hidden_size,
+      num_layers = num_layers,
+      batch_first = TRUE
+    )
+    
+    self$layer_norm <- nn_layer_norm(normalized_shape = hidden_size)
+    
+    self$fc1 <- nn_linear(hidden_size, hidden_size)
+    self$dropout1 <- nn_dropout(p = dropout_p)
+    
+    self$fc2 <- nn_linear(hidden_size, hidden_size)
+    self$dropout2 <- nn_dropout(p = dropout_p)
+    
+    self$fc3 <- nn_linear(hidden_size, hidden_size)
+    self$dropout3 <- nn_dropout(p = dropout_p)
+    
+    self$fc4 <- nn_linear(hidden_size, hidden_size)
+    self$dropout4 <- nn_dropout(p = dropout_p)
+    
+    self$output_layer <- nn_linear(hidden_size, num_classes)
+  },
+  
+  forward = function(x) {
+    gru_output <- self$gru(x)
+    h_n <- gru_output[[2]]
+    last_hidden_state <- h_n[dim(h_n)[1], , ]
+    
+    out <- self$fc1(last_hidden_state) %>% torch_tanh() %>% self$dropout1()
+    out <- self$fc2(out) %>% torch_tanh() %>% self$dropout2()
+    out <- self$fc3(out) %>% torch_tanh() %>% self$dropout3()
+    out <- self$fc4(out) %>% torch_tanh() %>% self$dropout4()
+    
+    logits <- self$output_layer(out)
+    return(logits)
+  }
+)
+```
+
+Data for the model instance is prepared. The hidden layer size is set to 128
+
+```{r}
+input_size <- ncol(tsa_df_X)
+hidden_size <- 128
+num_layers <- 3
+num_classes <- length(unique(tsa_df$traffic_class))
+```
+
+Based on the previously prepared data, an instance of the GRU model is created
+
+```{r}
+model <- GRUModel(input_size, hidden_size, num_layers, num_classes)
+```
+
+## Training of model
+
+Before training, instances of the objects necessary for training are created. The optimizer is designed to change model parameters based on gradients. The gradients of the loss function are calculated based on the object returned by the loss function instances, which contains a grad_fn field that allows for the calculation of gradients.
+
+Learning rate is also important – too high makes it difficult to obtain an optimal solution, but a general solution can be quickly found. When increasing accuracy is needed – searching for an optimal solution – the learning rate should be reduced, but this involves longer training time and higher risk of learning to the local minimum.
+
+Therefore, a variable learning rate will be used, which decreases depending on the model's performance.
+
+```{r}
+criterion <- nn_cross_entropy_loss()
+optimizer <- optim_adagrad(model$parameters, lr = 0.01)
+scheduler <- lr_reduce_on_plateau(
+  optimizer,
+  mode = "min",       
+  factor = 0.5,       
+  patience = 3,       
+  verbose = TRUE
+)
+```
+
+The number of epochs is fixed at 25
+
+```{r}
+num_epochs <- 25
+```
+
+An empty vector for integral losses is created.
+
+```{r}
+train_losses <- c()
+```
+
+Training loop. One subloop handles epochs. The second subloop handles batches.
+
+```{r}
+for (epoch in 1:num_epochs) {
+  model$train()
+  total_loss <- 0
+  pb <- progress_bar$new(
+    format = sprintf("Epoch %d [:bar] :percent | loss: :loss", epoch),
+    total = length(train_dl), clear = FALSE, width = 60
+  )
+  
+  coro::loop(for (batch in train_dl) {
+    optimizer$zero_grad()
+    y_pred <- model(batch$x)
+    loss <- criterion(y_pred, batch$y$to(dtype = torch_long()))
+    loss$backward()
+    optimizer$step()
+    
+    total_loss <- total_loss + loss$item()
+    pb$tick(tokens = list(loss = sprintf("%.3f", loss$item())))
+  })
+  
+  avg_loss <- total_loss / length(train_dl)
+  train_losses <- c(train_losses, avg_loss)
+  
+  if (epoch == num_epochs){
+  cat(sprintf("\nEpoch %d finished | avg_loss = %.3f\n", epoch, avg_loss))
+  }
+  
+  scheduler$step(avg_loss)
+}
+
+```
+
+## Model evaluation
+
+The model is placed in evaluation mode. Layers and mechanisms such as dropout are disabled in this mode.
+
+```{r}
+model$eval()
+```
+
+Next, after disabling the gradient calculation blocks, we perform predictions on the test set, storing the results in the appropriate variable.
+
+```{r}
+with_no_grad({
+  y_test_pred <- model(X_test_tensor)
+})
+```
+
+The obtained results are tensors. We convert them to vectors, but in the case of prediction, we specify the class indicated in the prediction with the torch_argmax function.
+
+```{r}
+y_test_pred_vec <- as.numeric(torch_argmax(y_test_pred, dim = 2))
+y_test_true_vec <- as.numeric(y_test_tensor)
+```
+
+### Accuracy calculation
+
+Using mean function to calculate accuracy
+
+```{r}
+accuracy <- mean(y_test_pred_vec == y_test_true_vec)
+cat(sprintf("Test Accuracy: %.3f\n", accuracy))
+```
+
+### Confusion Matrix calculation
+
+At the first, we have to define factor representing levels of traffic count.
+
+Otherwise it will be possible to get NaN values on confiusion matrix.
+
+```{r}
+all_levels <- factor(1:num_classes)
+```
+
+Before calculating confusion matrix we have to convert results and labels to DF
+
+```{r}
+results_df <- data.frame(
+  Truth = factor(y_test_true_vec, levels = all_levels),
+  Predicted = factor(y_test_pred_vec, levels = all_levels)
+)
+```
+
+Finally, we can calculate coefficents of confusion matrix using conf_mat function 
+
+```{r}
+cm <- conf_mat(results_df, Truth, Predicted)
+```
+
+It is possible to display confusion matrix using autoplot
+
+```{r}
+autoplot(cm, type = "heatmap") +
+  labs(title = "Confusion matrix for GRU model") +
+  scale_fill_gradient(low = "#D6EAF8", high = "#2874A6") # Opcjonalna zmiana kolorów
+```
+
+### AUC
+
+AUC is a metric which measuring efecienity of classification models. 
+
+Under the hood, AUC using ROC as a trademark area that indicates the surface area
+
+A the first, we have to convert logits into vector of probabilities using softmax
+
+```{r}
+y_test_proba <- as.data.frame(as.matrix(y_test_pred$softmax(dim = 2)))
+```
+
+Second step is to give some names to the columns
+
+```{r}
+colnames(y_test_proba) <- paste0(".pred_class", 1:num_classes) 
+```
+
+Adding new column with true class labels
+
+```{r}
+y_test_proba$truth <- factor(y_test_true_vec)
+```
+
+We have to obtain levels of test labels
+
+```{r}
+levels_truth <- levels(y_test_proba$truth)
+```
+
+We declarate empty numeric vector in order to fill it by auc values
+
+```{r}
+auc_values <- numeric(num_classes)
+```
+
+In the loop there is a calculation of auc (using auc function) by assing it to auc_values vector
+
+```{r}
+#| message: false
+#| warning: false
+for (k in 1:num_classes) {
+  pred_col <- paste0(".pred_class", k)
+  pred_vec <- as.numeric(y_test_proba[[pred_col]])
+  truth_vec <- as.integer(y_test_proba$truth == levels_truth[k])
+  auc_values[k] <- auc(truth_vec ~ pred_vec)
+}
+```
+
+After succesfully calculation it is possible to print values of AUC in the specified category
+
+```{r}
+macro_auc <- mean(auc_values)
+cat(sprintf("Macro AUC: %.3f\n", macro_auc))
+print(auc_values)
+```
+
+## ROC
+
+At the first, we calculate object of ROC calculation using pROC::roc function
+
+First step is to create empty list to fill it by ROC obejct of each category
+
+```{r}
+roc_objects <-list()
+```
+
+In the loop we calculate calculate values of ROC objects
+
+```{r}
+#| message: false
+#| warning: false
+for (k in 1:num_classes) {
+  pred_col <- paste0(".pred_class", k)
+  pred_vec <- as.numeric(y_test_proba[[pred_col]])
+  truth_vec <- as.integer(y_test_proba$truth == levels_truth[k])
+  roc_objects[[k]] <- roc(truth_vec, pred_vec)
+}
+```
+
+
+Firstly as early, we create empty list
+
+```{r}
+df_plot_objects <- list()
+```
+
+Then we calculate DF  objects
+
+```{r}
+
+for (roc_obj_index in seq_along(roc_objects)) {
+    roc_df <- data.frame(
+    specificity = rev(roc_objects[[roc_obj_index]]$specificities),
+    sensitivity = rev(roc_objects[[roc_obj_index]]$sensitivities)
+    )
+    df_plot_objects[[roc_obj_index]] = roc_df
+  }
+
+```
+
+At the end it is easy to display all plots
+
+```{r}
+for (category_plot_index in seq_along(df_plot_objects))
+{
+  roc_plot <- ggplot(df_plot_objects[[category_plot_index]], aes(x = 1 - specificity, y = sensitivity)) +
+    geom_line(color = "red", linewidth = 1.1) +
+    geom_abline(linetype = "dashed", color = "darkgrey") +
+    labs(
+      title= paste("ROC Curve for traffic class", category_plot_index),
+      x = "FPR (1 - Specificity)",
+      y = "TPR (Sensitivity)"
+    ) +
+    theme_minimal()
+  
+  print(roc_plot) 
+}
+```
+
