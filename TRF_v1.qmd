@@ -1,0 +1,229 @@
+---
+title: "TRF_v1"
+author: "Wojciech L."
+format: html
+editor: visual
+---
+
+## Loading libraries
+
+The first step is to load the libraries so that you don't have to do it in the next parts of the code.
+
+```{r}
+#| message: false
+#| warning: false
+library(torch)
+library(timeSeriesDataSets)
+library(DT)
+library(tsibble)
+library(dplyr)
+library(tidyr)
+library(tidymodels)
+library(lubridate)
+library(slider)
+library(ggplot2)
+library(yardstick)
+library(pROC)
+library(gridExtra)
+library(progress)
+library(timetk)
+library(tsibble)
+library(zoo)
+```
+
+
+```{r}
+data("elecdemand_msts", package = "timeSeriesDataSets")
+```
+
+```{r}
+class(elecdemand_msts)
+```
+
+
+```{r}
+datatable(head(elecdemand_msts), caption = "Fist few rows")
+```
+```{r}
+eldamnd_ts <- as_tsibble(elecdemand_msts)
+```
+
+```{r}
+eldamnd_df <- as_tibble(eldamnd_ts)
+```
+
+```{r}
+eldamnd_df <- eldamnd_df %>%
+  pivot_wider(names_from = key, values_from = value)
+```
+
+
+```{r}
+str(eldamnd_df)
+```
+
+```{r}
+head(eldamnd_df)
+```
+
+```{r}
+ggplot(eldamnd_df,aes(x = Demand))+
+  geom_histogram(binwidth = 0.01)
+```
+
+```{r}
+dividing_df <- function(df, divider){
+  nr <- nrow(df)
+  if (nrow(df)%% divider != 0)
+  {
+    stop("Select correct divider")
+  }
+  number_of_rows_in_cluster <- nr/divider
+  dividing_rows <- c()
+  for(n in 1:divider)
+  {
+    dividing_rows[n] = number_of_rows_in_cluster *n
+  }
+  df$demand_class <- 1:nrow(df)
+  
+  for(k in seq_along(dividing_rows))
+  {
+    df$demand_class[((k-1)*number_of_rows_in_cluster+1):dividing_rows[k]] <- k
+  }
+  return(df)
+}
+```
+
+
+```{r}
+eldamnd_df <- eldamnd_df %>%
+  arrange(Demand) %>%
+  dividing_df(divider = 4) %>%
+  arrange(index)
+```
+
+```{r}
+any(is.na(eldamnd_df))
+```
+```{r}
+any(is.nan(eldamnd_df$demand_class))
+```
+
+
+
+```{r}
+datatable(head(eldamnd_df))
+```
+```{r}
+#| message: false
+#| warning: false
+ggplot(eldamnd_df,aes(x = demand_class))+
+  geom_bar()
+```
+
+
+```{r}
+ggplot(eldamnd_df,aes(x = Temperature))+
+  geom_histogram(binwidth = 0.1)
+```
+```{r}
+unique(eldamnd_df$WorkDay)
+```
+
+```{r}
+colnames(eldamnd_df)
+```
+```{r}
+
+eldamnd_df_featured <- eldamnd_df %>%
+  arrange(index) %>%
+  mutate(
+    hour     = hour(index),
+    wday   = wday(index, label = TRUE, week_start = 1), 
+    yday  = yday(index),                               
+    month     = month(index, label = TRUE),               
+    quarter     = quarter(index),                            
+    year       = year(index)
+  )
+
+
+```
+
+```{r}
+head(eldamnd_df_featured)
+```
+
+
+### Lag features
+
+```{r}
+ eldamnd_df_featured <- eldamnd_df_featured %>%
+  mutate(
+    demand_lag_1    = lag(Demand, n = 1),   # Poprzedni odczyt
+    demand_lag_48   = lag(Demand, n = 48),  # Odczyt 24h temu
+    demand_lag_336  = lag(Demand, n = 48 * 7) # Odczyt tydzień temu
+  )
+```
+
+```{r}
+head(eldamnd_df_featured)
+```
+
+
+### Rolling features
+
+```{r}
+eldamnd_df_featured <- eldamnd_df_featured %>%
+  mutate(
+    demand_roll_mean_6 = zoo::rollmean(Demand, k = 6, fill = NA, align = "right")
+  ) %>%
+  # 2. Uzupełnij NA obliczoną średnią
+  mutate(
+    demand_roll_mean_6 = ifelse(
+      is.na(demand_roll_mean_6),                      # Warunek: czy wartość to NA?
+      mean(demand_roll_mean_6, na.rm = TRUE),         # Jeśli TAK: wstaw średnią z tej kolumny
+      demand_roll_mean_6                              # Jeśli NIE: zostaw oryginalną wartość
+    ))
+```
+
+```{r}
+head(eldamnd_df_featured)
+```
+
+
+
+```{r}
+dim(eldamnd_df_featured)
+```
+
+
+```{r}
+eldamnd_df_featured <- eldamnd_df_featured %>%
+  mutate(
+    # Kodowanie godziny (ta część była OK)
+    hour_sin = sin(2 * pi * hour / 24),
+    hour_cos = cos(2 * pi * hour / 24),
+    
+    # KODOWANIE DNIA TYGODNIA - POPRAWKA
+    # Dodajemy as.numeric(), aby zamienić factor ("Pon", "Wt"...) na liczbę (1, 2...)
+    wday_sin = sin(2 * pi * as.numeric(wday) / 7),
+    wday_cos = cos(2 * pi * as.numeric(wday) / 7),
+
+    # Kodowanie miesiąca (ta część była OK)
+    month_sin = sin(2 * pi * as.numeric(month) / 12),
+    month_cos = cos(2 * pi * as.numeric(month) / 12)
+  ) %>%
+  # Usuwamy oryginalne kolumny, które już nie są potrzebne
+  select(-hour, -month, -wday, -Demand)
+```
+
+```{r}
+head(eldamnd_df_featured)
+```
+
+
+```{r}
+eldamnd_df_X <- eldamnd_df_featured %>%
+  select(-demand_class)
+```
+
