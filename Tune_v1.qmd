@@ -1,0 +1,271 @@
+---
+title: "Random Forests - obtaining model hyperparameters by Bayesian optimization using parallel computing"
+author: "Wojciech L."
+format: html
+editor: visual
+---
+
+
+## 1. Introduction
+
+The main topics of this article are parameter selection and parallel computing. A Random Forest model will be constructed, whose parameters will be selected using Bayesian methods.
+
+Common problems in ML include selecting hyperparameters and calculating them efficiently. One of the most effective methods for calculating hyperparameters is Bayesian optimization. This is implemented in the tune_bayes function. Another package used will be doFuture for parallel computations. Standard data science libraries, such as tidymodels, dplyr, etc., will also be utilized.
+
+Therefore, the primary task of the project will be to develop functions for a time-efficient random forest model. The choice of random forests is justified by the method's high efficiency and its superior use of parallelism compared to Gradnet Boosting methods.
+
+The "Diamonds" data set will be used as the data set and the clarity column will be predicted.
+
+### Loading libraries
+
+```{r}
+#| message: false
+#| warning: false
+  library(dplyr)
+  library(tidymodels)
+  library(doFuture)
+  library(tictoc)
+  library(ranger)
+  library(DT)
+```
+
+## 2. Data preprocessing
+
+At first we have to convert clarity to unordered factor. Second step is to divide data into training and testing part by using initial_split function.
+
+```{r}
+prepare_data <- function(diamonds_df) {
+
+  
+  # Convert clarity to unordered factor
+  diamonds_df <- diamonds_df %>%
+    mutate(clarity = factor(clarity, ordered = FALSE))
+  
+  # Split data
+  diamonds_split <- initial_split(diamonds_df, prop = 0.8, strata = clarity)
+  list(
+    training = training(diamonds_split),
+    testing = testing(diamonds_split),
+    split = diamonds_split
+  )
+}
+```
+
+Second step of preprocessing is to define recipe of data and random forest model. The recipe specifies what data transformation steps must be performed to make the data ready for the model. The first step is step_corr - removing multiple correlated columns to prevent duplicate information. The next step is data normalization - to prevent the data from becoming information that has high numerical significance. The last step is step_dummy - converting categorical data into numbers.
+
+Next, we instantiate the model—the rand_forest function serves as an interface to the ranger model, and the mtry and min_n hyperparameters will be optimized. We assume 100 as the number of trees.
+
+The combination of recipe and model creates a workflow - this allows you to write shorter code later.
+
+```{r}
+setup_model <- function(training_data) {
+
+
+  rf_recipe <- recipe(clarity ~ ., data = training_data) %>%
+    step_corr() %>%
+    step_normalize(all_numeric_predictors()) %>%
+    step_dummy(all_nominal_predictors(), one_hot = TRUE)
+  
+
+  rf_model <- rand_forest(
+    mtry = tune(),
+    min_n = tune(),
+    trees = 100
+  ) %>%
+    set_engine("ranger") %>%
+    set_mode("classification")
+  
+  rf_workflow <- workflow() %>%
+    add_recipe(rf_recipe) %>%
+    add_model(rf_model)
+  
+  list(recipe = rf_recipe, model = rf_model, workflow = rf_workflow)
+}
+```
+
+## 3. Model tune and training
+
+The beginning of hyperparameter tuning is choosing whether we want the computation to be parallel or not.
+
+The next step is to select the V-Fold cross-validation object. This is used for model training, where the training set is divided into a specified number of parts—usually 5 or 10—in the example, 3 for simplicity. Then, in the subsequent steps, one-third of the training set is used for validation, the remaining two for training. Then, one of the parts previously used for training will be used for validation, while the previously used validation portion and the remaining training portion will be used for training, and so on. The vfold_cv function will be used for this purpose.
+
+### Bayesian optimization for  hiperparameter tuning
+
+Then, the Bayesian hyperparameter search mechanism is implemented.
+
+The first step is to create a sample hyperparameter tuning model so that the Bayesian optimizer can later "see" what this process entails. For this purpose, an initial_results object will be created—a simple hyperparameter tuning object from a specified set — rf_grid.
+
+Bayesian optimization doesn't evaluate all possible hyperparameter options; it learns how hyperparameters affect the outcome and uses probabilistic methods to select the best ones. This provides a significant time saving compared to grid_search.
+
+In order to obtain a set of the best hyperparameters, we create a tune_bayes object, the main element of which is the result of an example hyperparameter optimization using the initial_results method and the hyperparameter space optimized for a specific data set from the finalize function.
+
+The next step is to obtain the best hyperparameters. These are obtained via the select_best function, which specifies the metric and tuning object.
+
+We then apply the hyperparameters to the model through the workflow it is part of - using the finalize_workflow function.
+
+Workflow with optimized hyperparameters can be used for training using the fit function.
+
+```{r}
+tune_and_train <- function(workflow, training_data, future = FALSE) {
+  
+  if (future) {
+    n_cores <- parallel::detectCores() - 1
+    registerDoFuture()
+    plan(multisession, workers = n_cores)
+  } else {
+    plan(sequential)
+  }
+  
+  rf_cv_folds <- vfold_cv(training_data, v = 3)
+  
+  rf_grid <- expand.grid(
+    mtry = c(2, 3, 5, 7),
+    min_n = c(5, 10, 30)
+  )
+  
+  initial_results <- tune_grid(
+    workflow,
+    resamples = rf_cv_folds,
+    grid = rf_grid,
+    metrics = metric_set(accuracy, roc_auc),
+    control = control_grid(verbose = TRUE)
+  )
+  
+  rf_params <- parameters(workflow) %>%
+    finalize(training_data)
+  
+  set.seed(123)
+  bayes_results <- tune_bayes(
+    workflow,
+    resamples = rf_cv_folds,
+    param_info = rf_params,
+    initial = initial_results,
+    iter = 2,
+    metrics = metric_set(accuracy, roc_auc),
+    control = control_bayes(verbose = TRUE, no_improve = 5)
+  )
+  
+  best_rf_params <- select_best(bayes_results, metric = "roc_auc")
+  final_workflow <- finalize_workflow(workflow, best_rf_params)
+  
+  final_fit <- fit(final_workflow, data = training_data)
+  
+  list(
+    final_fit = final_fit,
+    bayes_results = bayes_results,
+    best_rf_params = best_rf_params 
+  )
+}
+
+```
+
+## 4. Model evaluation
+
+Once the model is trained, predictions can be made on the test set. This is achieved using the predict function.
+
+Predictions enable the calculation of metrics - accuracy, kappa and ROC-AUC.
+
+```{r}
+predict_and_evaluate <- function(final_fit, testing_data) {
+  
+  preds_class <- predict(final_fit, testing_data, type = "class")
+  preds_prob <- predict(final_fit, testing_data, type = "prob")
+  preds <- bind_cols(testing_data, preds_class, preds_prob)
+  
+  metrics_rf <- metrics(preds, truth = clarity, estimate = .pred_class)
+  roc_auc_rf <- roc_auc(preds, truth = clarity, starts_with(".pred_"), -.pred_class)
+  
+  list(metrics_rf = metrics_rf, roc_auc_rf = roc_auc_rf)
+}
+```
+
+## 5. Final function
+
+The functionalities obtained in the previous steps can be combined into one function.
+
+```{r}
+calculate_clarity_rf <- function(diamonds_df, future = FALSE) {
+
+  data <- prepare_data(diamonds_df)
+  model_setup <- setup_model(data$training)
+  
+  training_results <- tune_and_train(model_setup$workflow, data$training, future)
+  
+  results <- predict_and_evaluate(training_results$final_fit, data$testing)
+  
+  list(
+    metrics = results,
+    best_params = training_results$best_rf_params 
+  )
+}
+
+```
+
+
+## 6. Comparassion of sequential and parallel function
+
+Two calls to the final function allow us to assess whether there is a significant speedup in its execution if parallel computations are enabled.
+
+```{r}
+#| message: false
+#| warning: false
+# Test czasu bez równoległości
+tic("Sequential RF")
+res_sequential <- calculate_clarity_rf(diamonds, future = FALSE)
+toc()
+```
+
+```{r}
+#| message: false
+#| warning: false
+# Test czasu z równoległością
+ tic("Parallel RF")
+ res_parallel <- calculate_clarity_rf(diamonds, future = TRUE)
+ toc()
+```
+
+### Sequential - results
+
+Metrics - accuracy and kappa
+
+```{r}
+datatable(res_sequential$metrics$metrics_rf)
+```
+
+Metric - ROC-AUC
+
+```{r}
+datatable(res_sequential$metrics$roc_auc_rf)
+```
+
+Hyperparameters used for model
+
+```{r}
+datatable(res_sequential$best_params)
+```
+
+### Parallel - results
+
+Metrics - accuracy and kappa
+
+```{r}
+datatable(res_parallel$metrics$metrics_rf)
+```
+
+Metric - ROC-AUC
+
+```{r}
+datatable(res_parallel$metrics$roc_auc_rf)
+```
+
+Hyperparameters used for model
+
+```{r}
+datatable(res_parallel$best_params)
+```
+
+## 7. Conclusion
+
+The resulting hyperparameter sets allowed us to obtain an effective model that provided good metrics. Similarly, the use of parallel computations accelerated the execution time of the main function.
+
+However, it should be noted that the obtained speedup was not proportional to the number of available processors. The limitation of parallel processing results from the nature of hyperparameter selection using the adopted methods and other factors that cause sequential processing.
