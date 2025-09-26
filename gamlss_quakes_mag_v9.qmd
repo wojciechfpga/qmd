@@ -1,0 +1,454 @@
+---
+title: "Using the GAMLSS package and the BCPEo distribution to define the performance of an earthquake detection system"
+author: "Wojciech L."
+format: html
+editor: visual
+---
+
+## Introduction
+
+The purpose of this study is to evaluate the effectiveness of the existing earthquake detection system using measurement stations. The requirement is to detect earthquakes proportionally to their magnitude. It is assumed that the stations should be evenly distributed so that an equal number of stations detect an earthquake of a given magnitude in the affected area. This strategy allows for covering dead zones.
+
+If the above requirement is met, the number of stations detecting an earthquake should follow a normal distribution.
+
+To verify this, it is necessary to first assess the earthquake magnitude distribution. In the case of variable skewness or high kurtosis, this requirement will not be met.
+
+To perform such an assessment, it is necessary to obtain an estimate of the distribution and then assess its skewness and kurtosis. Additional information can also be derived from the expected value and sigma.
+
+The best tool for such estimation is the GAMLSS package, which allows modeling the estimation of parameters of distributions with variable kurtosis and skewness.
+
+## 1. Loading libraries and data
+
+```{r}
+#| message: false
+#| warning: false
+library(ggplot2)
+library(leaflet)
+library(gamlss)
+library(dplyr)
+library(tidyr)
+library(tidymodels)
+library(corrplot)
+library(DT)
+library(dbscan)
+library(gt)
+```
+
+```{r}
+data("quakes")
+```
+
+## 2. Initial data exploring
+
+The first step is preliminary data exploration to identify potential issues when building the GAMLSS model.
+
+## Plots
+
+### Data insight
+
+Quakes dataset is about earth quakes in Melanesia.
+
+```{r}
+leaflet() %>%
+  addTiles() %>%
+  addMarkers(lng = quakes$long, lat = quakes$lat)
+```
+
+
+### Denisty
+
+The graph of the strength of the number of earthquakes of a given magnitude will allow us to estimate the initial shape of the graph
+
+```{r}
+ggplot(quakes, aes(x = mag)) +
+  geom_density()+
+  labs(
+    title = "Magnitude density",
+    subtitle = "Histogram equivalent",
+    caption = "Source - Quakes data set"
+  )
+```
+
+### Occurence
+
+In order to find the dependence of magnitude on the number of stations, a scatter plot will be displayed
+
+```{r}
+ggplot(quakes, aes(x = stations, y = mag))+
+  geom_point()+
+  labs(
+    title = "Number of stations - Magnitude",
+    subtitle = "Ponts indicating occurence",
+    caption = "Source - Quakes data set"
+  )
+```
+
+Unfortunately, a scatter plot doesn't provide information about how many points overlap. For that, it will need to use more advanced graphs.
+
+```{r}
+ggplot(quakes, aes(x = stations, y = mag))+
+  geom_count()+
+  labs(
+    title = "Number of stations - Magnitude",
+    subtitle = "Ponts size indicating number of occurence",
+    caption = "Source - Quakes data set"
+  )
+```
+
+Particularly useful is the chart showing the number of overlapping points in colors - bin2d
+
+```{r}
+ggplot(quakes, aes(x = stations, y = mag))+
+  geom_bin2d(binwidth = c(2, 0.1))+
+  labs(
+    title = "Number of stations - Magnitude",
+    subtitle = "Colors indicating number of occurence",
+    caption = "Source - Quakes data set"
+  )
+```
+
+The highest number of earthquakes occurs with a small number of recording stations. However, there are often weak earthquakes, but also earthquakes with high magnitudes, suggesting a skewed data distribution within the initial range of station values.
+
+A large number of stations records significantly fewer earthquakes, but these are usually stronger.
+
+### With outliers
+
+To demonstrate the gamlss::fitDist method for finding a distribution, it will be called on a set containing outliers
+
+```{r}
+dist_ranking <- gamlss::fitDist(quakes$mag, type = "realplus")
+```
+
+A data frame will then be created based on the result.
+
+```{r}
+distributions_tibble <- tibble(
+  Distribution = names(dist_ranking$fits),
+  Score = round(dist_ranking$fits, 2)
+)
+```
+
+Using the package, a ranking of distributions that best describe the magnitude column will be displayed.
+
+```{r}
+datatable(distributions_tibble)
+```
+
+The BCPE and BCPEo distributions proved to be the best. The question remains whether removing outliers would change the suggested distribution or the estimated AIC value.
+
+### Without outliers
+
+To remove outliers, the DBSCAN method is used, which only works on numeric columns.
+
+```{r}
+quakes_numeric <- quakes %>%
+  select(where(is.numeric))
+```
+
+A DBSCAN object is then created containing the clustering summary.
+
+```{r}
+dbscan_results <- dbscan(quakes_numeric,eps = 11 ,minPts = 7)
+```
+
+The DBSCAN object includes a cluster attribute that returns the cluster value for each row. A value of zero indicates that the row is an outlier.
+
+```{r}
+quakes_numeric_with_cluster <- quakes_numeric %>%
+  mutate(cluster = dbscan_results$cluster)
+```
+
+Therefore, rows that do not belong to any cluster are filtered.
+
+```{r}
+quakes_no_outliers <- quakes_numeric_with_cluster %>%
+  filter(cluster != 0)
+```
+
+
+### Finding the correct data distribution
+
+Then, to find the correct distribution for the data with outliers removed, the previously presented distribution finding procedure using fitDist will be performed.
+
+```{r}
+dist_ranking <- gamlss::fitDist(quakes_no_outliers$mag, type = "realplus")
+```
+
+Tibble with results of fitting dist.
+
+```{r}
+distributions_tibble <- tibble(
+  Distribution = names(dist_ranking$fits),
+  Score = round(dist_ranking$fits, 2)
+)
+```
+
+```{r}
+datatable(distributions_tibble)
+```
+
+As before, the best choice is the BCPE or BCPEo distribution. This distribution has variable expected value, skewness, and kurtosis, indicating that the monitoring system does not meet the requirements of no dead zones and technological uniformity.
+
+It should be noted that removing outliers significantly reduced the predicted AIC value, which indicates that it was necessary.
+
+The BCPE distribution is created by transforming the data using the Box-Cox transformation, which helps reduce skewness, which is difficult to model. The resulting Power Exposure distribution is then assumed, which has a variable expected value, scale parameter (sigma), skewness, and kurtosis.
+
+The BCPE distribution has two variants: BCPE and BCPEo. The BCPE distribution is better for precise data modeling—the best-fit distribution. However, we obtain data on the distribution parameters after the Box-Cox transformation. Because this study requires analyzing the original data, it is advisable to use the BCPEo distribution, as it returns the data parameters before the Box-Cox transformation.
+
+## 2. Creating a gamlss object and predicting the distribution parameters
+
+Creating a gamlss object and predicting the distribution parameters.  
+
+First, a simple model will be created that makes the earthquake strength dependent only on the number of stations.
+
+```{r}
+#| message: false
+#| warning: false
+gamlss_object_simple <- gamlss(
+  mag ~ cs(stations),
+  sigma.formula = ~cs(stations),
+  nu.formula = ~cs(stations), 
+  tau.formula = ~cs(stations), 
+  family = BCPEo(),
+  data = quakes_no_outliers,
+  control = gamlss.control(n.cyc = 40)
+)
+```
+A worm plot is created, which is a modified version of the quantile-quantile plot. The x-axis is expected to be covered by the estimated distribution.
+
+```{r}
+wp(gamlss_object_simple)
+```
+
+The model doesn't look very good. The red line is indeed close to the x-axis, but the points—the actual values—are far from it and the x-axis. Furthermore, some of the points fall outside the confidence interval—the upper and lower parabolas. The model needs to be improved.
+
+```{r}
+#| message: true
+#| warning: false
+gamlss_object_complex <- gamlss(
+  mag ~ pb(stations) +pb(lat)+pb(long)+pb(depth),
+  sigma.formula = ~pb(stations) +pb(lat)+pb(long)+pb(depth),
+  nu.formula = ~pb(stations) +pb(lat)+pb(long)+pb(depth), 
+  tau.formula = ~pb(stations) +pb(lat)+pb(long)+pb(depth), 
+  family = BCPEo(),
+  data = quakes_no_outliers,
+  control = gamlss.control(n.cyc = 10)
+)
+```
+
+
+
+```{r}
+wp(gamlss_object_complex)
+```
+
+The Worm Plot shows that the red line, which should be on the x-axis, is near it. If it were aligned with the x-axis, the data would be perfectly modeled by the assumed distribution – BCPEo. It approximates the fits to the points.
+
+Another element – the small circles in the plot are the actual data. You can see that all the data are near both the x-axis and the red line. Ideally, all the circles should lie on the x-axis.
+
+You can also see that none of the points fall within the parabola – the outliers are within acceptable limits. 
+
+### Model comparassion - GAIC
+
+Based on Generlized AIC model are compared
+
+
+```{r}
+result_gaic <- tibble(
+  Model = c("Simple", "Complex"),
+  Score = c(GAIC(gamlss_object_simple),GAIC(gamlss_object_complex))
+)
+```
+
+```{r}
+ggplot(result_gaic, aes(x = Model, y = Score))+
+  geom_col(fill = "red") +
+  labs(title = "GAIC Comparison", subtitle = "Lower is better")
+```
+
+It is clearly visible that the complex model has better results - lower GAIC
+
+### Residual Analysis
+
+The residual analysis shows how error of model behave within the data.
+
+Using the plot function on the GAMLSS object allows you to obtain all the necessary graphs.
+
+For simple model:
+
+```{r}
+plot(gamlss_object_simple)
+```
+For complex model:
+
+```{r}
+plot(gamlss_object_complex)
+```
+The Against Fitted Values plot shows no pattern; the data are randomly but evenly distributed around the axis, meaning that for all data and estimated values, the errors are similar. It's clear that the random arrangement of points around the x-axis in the Against Index plot allows us to conclude that this requirement is met in both models—the residuals are independent of the order. Similarly, in both cases, the Density Estimate—residuals—errors—are normally distributed. The Normal Q-Q plot also shows a strong overlap between the red line and the straight line, which also suggests a normal distribution of residuals.
+
+Also, a kurtosis close to 3, a skewness and expected value close to zero, and a standard deviation of one in the publication indicate that the residuals in both cases are distributed close to normal.
+
+The conclusion is that the obtained results of estimating the earthquake distribution are subject to errors that can be approximated by a normal distribution.
+
+### Testing model for absence of main predictor - drop1 
+
+To assess whether a simple model has any effectiveness, a drop1 test should be conducted. It has a null hypothesis - H0 - that removing a given variable (spline) does not affect the result.
+
+```{r}
+#| message: false
+#| warning: false
+drop1_results <- drop1(gamlss_object_simple, what = "mu")
+```
+
+The data is presented in the table below.
+
+```{r}
+gt(drop1_results)
+```
+
+The results show that without the cs(stations) component, the AIC value is higher, which means that it is a useful component for the model. An additional test result - probability P (very low) - biases against the fact that bs(station) explains nothing.
+
+## 3. Prediction and evaluation
+
+This section will present model efficiency tests - separately for the complex and simple models.
+
+### Simple model
+
+Then, using the predictAll function, we calculate the expected values and other parameters of the BCPEo distribution
+
+```{r}
+prediction_from_gamlss_simple <- predictAll(gamlss_object_simple, type = "response")
+```
+
+The results are placed in a data frame
+
+```{r}
+df_preds_simple <- quakes_no_outliers %>%
+  mutate(
+    mu    = prediction_from_gamlss_simple$mu,
+    sigma = prediction_from_gamlss_simple$sigma,
+    nu    = prediction_from_gamlss_simple$nu,
+    tau   = prediction_from_gamlss_simple$tau
+  )
+```
+
+The first graph is the expected value - mu
+
+```{r}
+ggplot(df_preds_simple, aes(x = stations, y = mag )) +
+  geom_point() +
+  geom_line(
+    aes(x = stations, y = mu),
+    color = "green",
+    linewidth = 1.5
+  ) +
+  labs(title = "mu")
+```
+
+It's clear that for a simple model, linear regression would be a better solution than splines. The conclusion is also that as the number of stations that observed an earthquake increases, its magnitude increases.
+
+The next graph is sigma.
+
+```{r}
+ggplot(df_preds_simple, aes(x = stations, y = sigma)) +
+  geom_line() +
+  labs(title = "sigma")
+```
+The graph above shows that the greatest variability in the magnitude-to-station relationship occurs where the number of stations observing the earthquake is small. As the number of stations increases, the relationship stabilizes.
+
+```{r}
+ggplot(df_preds_simple, aes(x = stations, y = nu)) +
+  geom_line() +
+  labs(title = "nu")
+```
+
+A small number of stations often detect a disproportionate number of strong earthquakes (relative to the number of weak earthquakes). This indicates a problem where strong earthquakes are not adequately observed by enough stations. This is confirmed by the negative skewness for low station values. For large station values, the distribution is reversed—the distribution is right-skewed—positively skewed. This means that many earthquakes with very strong magnitudes are detected by the same number of stations as much weaker ones. This is evidenced by the positive skewness for magnitudes when a large number of stations detect an earthquake.
+
+The next parameter is tau. It determines how "fat" the tails of the distribution are.
+
+```{r}
+ggplot(df_preds_simple, aes(x = stations, y = tau)) +
+  geom_line() +
+  labs(title = "tau")
+```
+
+High kurtosis means a high concentration around the expected value, but also a large number of values - outliers - that have very big values. This is the situation at the beginning and end of the graph. In the middle, there is a relatively stable kurtosis, oscillating around the range of 2-5. In a certain region, it reaches around 3, corresponding to the kurtosis of a mesokurtic distribution. The conclusion is that the most balanced concentration around the mean is obtained for the median station – then the earthquake magnitudes are concentrated around the mean well-balanced – without tails, excessive peaks, or excessive flattening of the distribution.
+
+The next chart is the centilies chart.
+
+```{r}
+#| message: false
+#| warning: false
+centiles(gamlss_object_simple, xvar = df_preds_simple$stations)
+```
+
+The graph above shows that the individual percentile lines are not symmetrical, indicating that the distribution is skewed, as previously confirmed.
+
+The change in the distance between the curves is not constant – initially low, it increases with the number of stations, indicating an increase in variance, only to later decrease again. This was confirmed by the sigma graph.
+
+### Complex model
+
+We proceed in a similar manner to the case with a simple model, drawing subsequent graphs.
+
+```{r}
+prediction_from_gamlss_complex <- predictAll(gamlss_object_complex, type = "response")
+```
+
+```{r}
+df_preds_complex <- quakes_no_outliers %>%
+  mutate(
+    mu    = prediction_from_gamlss_complex$mu,
+    sigma = prediction_from_gamlss_complex$sigma,
+    nu    = prediction_from_gamlss_complex$nu,
+    tau   = prediction_from_gamlss_complex$tau
+  )
+```
+
+```{r}
+ggplot(df_preds_complex, aes(x = stations, y = mag )) +
+  geom_point() +
+  geom_line(
+    aes(x = stations, y = mu),
+    color = "green",
+    linewidth = 1.5
+  ) +
+  labs(title = "mu")
+```
+
+```{r}
+ggplot(df_preds_complex, aes(x = stations, y = sigma)) +
+  geom_line() +
+  labs(title = "sigma")
+```
+
+```{r}
+ggplot(df_preds_complex, aes(x = stations, y = nu)) +
+  geom_line() +
+  labs(title = "nu")
+```
+
+```{r}
+ggplot(df_preds_complex, aes(x = stations, y = tau)) +
+  geom_line() +
+  labs(title = "tau")
+```
+
+```{r}
+#| message: false
+#| warning: false
+centiles(gamlss_object_complex, xvar = df_preds_complex$stations)
+```
+
+It is clearly visible that although the complex model gives better results on the Worm Plot, it does not mean much in practice - it turns out that the obtained graphs allow drawing similar conclusions about the data in the simple model, and what is more, the model is more complicated.
+
+## 4. Summary
+
+
+Based on the results, it should be concluded that the earthquake detection system does not meet the requirements for predictability of the relationship - number of detection stations - earthquake strength.
+
+These results suggest that a station-based warning system is misleading. A small number of stations often detect strong earthquakes, meaning that many strong earthquakes are detected by a small number of stations, which reduces the ability to assess their risk. This results from the skewness of the magnitude distribution – initially, the distribution is left-skewed – with a negative skewness value. Around the median number of detecting stations, everything is fine – the skewness oscillates around zero. However, with large numbers of stations, there is an over-concentration around relatively low magnitudes. This results from the added skewness in this region. This means that for earthquakes with a large number of detecting stations, their magnitude values are relatively low for the number of stations. This means that there is a problem: a large number of stations means the detection of very strong earthquakes – but this does not significantly increase the number of stations that detect them. The problem, therefore, is the insufficient number of stations or their uneven distribution.
+
+Kurtosis variability—high for extreme values—indicates that a small number of stations—high kurtosis—means high clustering around the expected value near the extreme values of the stations' recordings. This means that for extreme values, most earthquakes are concentrated around the mean value, but outliers lying very far from the expected value may occur.
+
+Creating a more complex model doesn't necessarily lead to a better model in practice. Instead of providing a better understanding of the chosen relationship, a more complex model may attempt to perfectly match the metrics.
+
