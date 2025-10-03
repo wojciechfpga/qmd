@@ -1,0 +1,342 @@
+---
+title: "Assessing the impact of diamond purity on price using the GAMLSS package and the TukeyHSD test"
+author: "Wojciech L."
+format: html
+editor: visual
+---
+
+## Introduction
+
+This study will analyze the impact of diamond clarity on its price.
+
+The most important parameter determining a diamond's price is its weight, but as is obvious and will be confirmed by subsequent analysis, it is not the only factor.
+
+To assess how diamond clarity affects its price, the TukeyHSD test will be used first, preceded by an AOV check. The TukeyHSD test will answer the question of how diamonds differ in price with a given clarity.
+
+Assessing the impact of diamond clarity on price across specific diamond weight ranges will be more difficult – an analysis using the GAMLSS tool will answer this question.
+
+## 1. Loading libraries and data
+
+```{r}
+#| message: false
+#| warning: false
+library(ggplot2)
+library(dbscan)
+library(dplyr)
+library(gamlss)
+library(DT)
+library(ggeffects)
+library(emmeans)
+data("diamonds")
+```
+
+## 2. Data - Exploration
+
+The first step is to evaluate the price distribution
+
+```{r}
+ggplot(diamonds, aes(x = price))+
+  geom_density()
+```
+The high skewness of the distribution is clearly visible.
+
+```{r}
+ggplot(diamonds, aes(sample = price))+
+  stat_qq()+
+  stat_qq_line()
+```
+
+The Q-Q graph confirms the previous observation – the distribution of diamond prices is strongly right-skewed, although in a small area (where it covers the lower part of the graph below the reference line) it is slightly left-skewed.
+
+It is clearly visible that at the central points, the deviations from the line are small, but at the ends of the curve, the deviations are significant, suggesting a leptokurtic distribution.
+
+The next step is a visual analysis of the main part of the problem – the relationship between price/mass and purity. A scatter plot is ideal for this purpose.
+
+```{r}
+ggplot(diamonds, aes( x = carat, y = price, color = clarity))+
+  geom_point()
+```
+
+It is clear that there is a strong correlation between the purity of a diamond and its price at a given weight - the points on the graph are strongly grouped together.
+
+## 3. Data preprocessing
+
+To reduce the negative effects of outliers, outliers should be removed. This is achieved using the DBSCAN clustering method.
+
+### Outliers removing
+
+Categorical and numeric columns are selected first. DBSCAN only works with numeric data.
+
+```{r}
+diamonds_num <- diamonds %>%
+  select(where(is.numeric))
+
+diamonds_cat <- diamonds %>%
+  select(!where(is.numeric))
+```
+
+Next, a DBSCAN object is created. We specify a radius of four to define the neighborhood and the number of points in the neighborhood for the point to be considered a core point.
+
+```{r}
+dbscan_diamonds <- dbscan(diamonds_num, eps = 4, minPts = 10)
+```
+
+In the DBSCAN method, assigning a value of zero to a cluster indicates that it is considered noise/outlier.
+
+```{r}
+sum(dbscan_diamonds$cluster != 0)
+```
+
+The numeric columns are then merged back into the categorical columns and then outliers are filtered out.
+
+```{r}
+diamonds_num <- diamonds_num %>%
+  mutate(cluster = dbscan_diamonds$cluster)
+
+diamonds_no_outlier <- diamonds_num %>%
+  bind_cols(diamonds_cat)
+
+diamonds_no_outlier <- diamonds_no_outlier %>%
+  filter(cluster != 0)
+```
+
+Total number of rows after removing outliers.
+
+```{r}
+nrow(diamonds_no_outlier)
+```
+
+
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+diamonds_no_outlier<- diamonds_no_outlier[sample(nrow(diamonds_no_outlier), 5000), ]
+```
+
+### Exploring processed data
+
+The scatter plot after removing outliers shows a more predictable structure.
+
+```{r}
+ggplot(diamonds_no_outlier, aes( x = carat, y = price, color = clarity))+
+  geom_point()
+```
+It is clearly visible that diamonds with a clarity grade of IF are usually the most expensive, while those with a clarity grade of I1 are the cheapest in a given weight range.
+
+In order to assess the change in the price/weight ratio - and therefore the share of other factors in the price - a graph with the geom_bin2d geometry was prepared.
+
+```{r}
+ggplot(diamonds_no_outlier, aes( x = carat, y = price))+
+  geom_bin2d()
+```
+It's worth emphasizing that most diamonds are offered in the low-weight and low-price range, but the price/weight ratio is usually constant there. As the diamond's weight increases, the price/weight ratio spread also increases—that is, the contribution of other factors to the absolute price/weight ratio.
+
+## 4. Finding correct distributions
+
+Next, we need to approximate the price distribution. To find the probability distribution that best approximates the price distribution, we use the fitDist function from gamlss.
+
+```{r}
+#| eval: false
+diamonds_price_distribution_ranking <- fitDist(diamonds_no_outlier$price, type = "realplus")
+```
+
+```{r}
+#| include: false
+diamonds_price_distribution_ranking <- fitDist(diamonds_no_outlier$price, type = "realplus")
+```
+
+The fitDist function returns an object with a fits attribute containing a vector of best-fitting distributions along with the GAIC criterion value. The results are stored in a tibble.
+
+```{r}
+diamonds_price_distribution_ranking_df <- tibble(
+  Distribution = diamonds_price_distribution_ranking$fits,
+  GAIC = names(diamonds_price_distribution_ranking$fits)
+)
+```
+
+Having the ranking of distributions stored in tibble, you can easily display them using the DT package.
+
+```{r}
+datatable(diamonds_price_distribution_ranking_df)
+```
+Due to the fact that kurtosis will play a limited role in the analysis, one can sometimes consider a simplified distribution - like IG (Inverse Gaussian), which assumes constant kurtosis and skewness.
+
+## 5. Creation and evaluation of the GAMLSS model
+
+First, a gamlss is created that estimates the price distribution using splines.
+
+```{r}
+#| eval: false
+gamlss_object_diamonds_price <- gamlss(
+  price ~ cs(carat),
+  sigma.formula = ~cs(carat),
+  nu.formula = ~cs(carat), 
+  tau.formula = ~cs(carat),
+  data = diamonds_no_outlier,
+  family = BCPEo()
+)
+```
+
+```{r}
+#| include: false
+gamlss_object_diamonds_price <- gamlss(
+  price ~ cs(carat),
+  sigma.formula = ~cs(carat),
+  nu.formula = ~cs(carat), 
+  tau.formula = ~cs(carat),
+  data = diamonds_no_outlier,
+  family = BCPEo()
+)
+```
+
+### Residual analysis
+
+To analyze how and where the model is wrong, you need to use the plot function to draw graphs of the distribution of residuals.
+
+```{r}
+plot(gamlss_object_diamonds_price)
+```
+
+Residuals: It is clear that the residuals (model errors) do not change significantly as a function of the expected value – there is symmetry around the horizontal axis. The even distribution of residuals around the horizontal axis in the index plot also indicates that the error does not depend on the order of transfer. The lower graphs show that the residuals are normally distributed – both in the density and Q-Q plot.
+
+The next step is the Worm Plot, which is a generalization of the Q-Q plot. It allows us to assess the quality of the distribution of price estimates and its characteristics.It shows the normalized quantile residuals as a function of deviations from the expected value.
+
+```{r}
+wp(gamlss_object_diamonds_price)
+```
+
+It can be seen that the obtained model fits the data well in the middle range and has major problems with estimation in the extreme values.
+
+### Prediction of distribution parameters
+
+Predictions of distribution parameters can be obtained using the predictAll function.
+
+```{r}
+prediction_of_distribution_parameters <- predictAll(gamlss_object_diamonds_price, type = "response")
+```
+
+Data with distribution parameters are saved to tibble.
+
+```{r}
+prediction_df <- tibble(
+  carat = diamonds_no_outlier$carat,
+  mu = prediction_of_distribution_parameters$mu,
+  sigma = prediction_of_distribution_parameters$sigma,
+  nu = prediction_of_distribution_parameters$nu,
+  tau = prediction_of_distribution_parameters$tau
+)
+```
+
+### Visualization of distribution parameters
+
+First, a graph of the mu parameter will be shown. This represents the expected/average price relative to the diamond's weight.
+
+```{r}
+ggplot(prediction_df, aes(x = carat, y = mu))+
+  geom_point(data = diamonds_no_outlier, aes(x = carat, y = price, color = clarity))+
+  geom_line(color = "red", linewidth = 1.5)
+```
+The chart clearly shows that as the diamond's weight increases, the price increases, but the clarity grade has a significant impact on the price. It's clear that the individual clarity grades create layers within the points, meaning that diamonds of a given weight and clarity grade cost more or less than other diamonds of the same weight but different clarity grades.
+
+The next graph shows how the sigma parameter changes. The sigma parameter shows how values deviate from the current expected value mu.
+
+```{r}
+ggplot(prediction_df, aes(x = carat, y = sigma))+
+  geom_line(color = "red", linewidth = 1.5)
+```
+It's clear that the sigma parameter is initially unstable, but at a more or less constant level. It increases at higher values. This is confirmed by the observation from the mu graph – initially, the points are relatively clustered around the expected value, but later, at higher carat values, they become more scattered.
+
+The next parameter is skewness - nu.
+
+```{r}
+ggplot(prediction_df, aes(x = carat, y = nu))+
+  geom_line(color = "red", linewidth = 1.5)
+```
+It's clear that the price distribution initially follows a normal distribution, with nu around zero. However, as diamond weight increases, this parameter increases and the distribution becomes right-skewed. This means that diamonds with a large weight often have very high prices.
+
+The next graph is the kurtosis graph.
+
+```{r}
+ggplot(prediction_df, aes(x = carat, y = tau))+
+  geom_line(color = "red", linewidth = 1.5)
+```
+Kurtosis shows the probability of large outliers. It is clear that with high diamond mass values, the probability of significant outliers increases. This is consistent with the scatter plot, nu, and sigma graphs.
+
+### Evaluating the impact of clarity on price differences between diamonds - TukeyHSD test
+
+The next step is to perform an ANOVA test to determine whether there is a relationship between price and clarity.
+
+```{r}
+aov_price_clarity <- aov(price ~ clarity, data = diamonds_no_outlier)
+```
+
+The ANOVA test only determines whether a relationship exists but does not determine its strength. This is what the TukeyHSD test is for, for example, to determine how the prices of individual clarity categories differ.
+
+```{r}
+TukeyHSD(aov_price_clarity)
+```
+The above text shows that individual clarity grades can differ significantly in price, but not significantly. For example, pairs of SI2-I1, VVS1-VVS2, and IF-VVS1 diamonds do not differ significantly in price. However, pairs of diamonds with VVS2-I1 or VS2-SI2 clarity grades do differ significantly in price.
+
+## 6. Creating a GAMLSS model that takes into account the interaction between clarity classes and price
+
+Then a gamlss model will be created that will reproduce price predictions for individual clarity categories. Due to the fact that the BCPEo distribution is very difficult to model for complex cases, the IG - Inverse Gaussian distribution was used, which is completely sufficient for the analysis of the change in the expected value depending on the mass of diamonds for individual clarity values.
+
+```{r}
+#| include: false
+gamlss_object_diamonds_price_interaction <- gamlss(
+  price ~ pb(carat)*clarity,
+  sigma.formula = ~pb(carat)*clarity,
+  data = diamonds_no_outlier,
+  family = IG()
+)
+```
+
+Estimation of distribution parameters:
+
+```{r}
+prediction_of_distribution_parameters_interaction <- predictAll(gamlss_object_diamonds_price_interaction, type = "response")
+```
+
+The estimation results are placed in tibble.
+
+```{r}
+prediction_df_interaction <- tibble(
+  carat = diamonds_no_outlier$carat,
+  mu = prediction_of_distribution_parameters_interaction$mu,
+  sigma = prediction_of_distribution_parameters_interaction$sigma,
+  nu = prediction_of_distribution_parameters_interaction$nu,
+  tau = prediction_of_distribution_parameters_interaction$tau
+)
+```
+
+
+### Calculation of the price chart for each clarity class
+
+A prediction of the expected price value is made for each clarity value.
+
+```{r}
+predicted_effects_color <- ggpredict(gamlss_object_diamonds_price_interaction,, terms = c("carat [all]", "clarity"))
+```
+
+The obtained results are visualized in the form of a graph.
+
+```{r}
+plot(predicted_effects_color) +
+  labs(title = "Interaction: The Effect of Color on Price Depending on the Weight of the Diamond",
+       x = "Carat",
+       y = "Price") +
+  theme_minimal()+
+  geom_line(data = prediction_df, aes(x = carat, y = mu), color = "green", linewidth = 1.2,inherit.aes = FALSE)
+```
+It's clear that the chart confirms the TukeyHSD test results and also allows us to observe the variability of price differences depending on carat. For example, the chart shows that the prices of IF and I1 clarity diamonds differ significantly – and it also shows how this change occurs depending on the diamond's weight. Initially, the difference is not large, but it increases as the diamond's weight increases.
+
+## 7. Summary
+
+Diamond prices in low weight ranges are relatively easy to predict based on expected values. This is confirmed by the sigma parameter graph. Prices for large diamonds are more difficult to predict.
+
+In the case of large weight diamonds, exceptions with very high prices should be considered. The price range for large diamonds is characterized by high kurtosis, which confirms this observation.
+
+Individual diamonds of similar weight differ in price, and the factor that largely determines this is the difference in clarity between diamonds of similar weight.
+
+The price-to-weight relationship for diamonds of a given clarity allows us to assess that as the diamond weight increases, the price difference between diamonds of different clarity increases significantly. This relationship is wavy and is more or less similar in shape—but not magnitude—for all clarity categories.
