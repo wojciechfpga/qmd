@@ -1,0 +1,480 @@
+---
+title: "Analysis of earthquake data in specific regions of the quakes collection area using Plotly"
+author: "Wojciech L."
+format: html
+editor: visual
+---
+
+## Introduction
+
+The purpose of this analysis is to determine the characteristics of earthquakes in specific regions of Melanesia. Earthquakes in this region are described by a quakes dataset. This dataset provides earthquake coordinates. This area will be divided into three earthquake-concentrated areas: western, eastern, and southern.
+
+This analysis allows us to answer questions about the characteristics of earthquakes in particular regions.
+
+## 1. Loading libraries and data
+
+```{r}
+#| message: false
+#| warning: false
+library(ggplot2)
+library(leaflet)
+library(plotly)
+library(dplyr)
+library(tidyr)
+```
+
+```{r}
+data("quakes")
+```
+
+```{r}
+quakes_df <- quakes
+```
+
+## 2. Initial data exploration
+
+First, we evaluate the structure of the geographic coordinates and the earthquake map.
+
+First, the map will be analyzed.
+
+```{r}
+leaflet() %>%
+  addTiles() %>%
+  addCircleMarkers(lng = quakes_df$long,
+                   lat = quakes_df$lat,
+                   color = "red")
+```
+
+The map clearly shows that the earthquake coordinate points are grouped into 3 areas - east, west and south.
+
+Next, a histogram analysis of geographic coordinates will be performed.
+
+```{r}
+plot_ly(data = quakes_df, x = ~lat) %>%
+  add_histogram() %>%
+  layout(title = "Distribution of Earthquake Latitiude")
+```
+
+```{r}
+plot_ly(data = quakes_df, x = ~long) %>%
+  add_histogram() %>%
+  layout(title = "Distribution of Earthquake Longitiude")
+```
+
+Histograms of geographic coordinates confirm the earthquake map analysis - there are three areas of earthquake concentration.
+
+The next element is the analysis of the earthquake magnitude histogram.
+
+```{r}
+plot_ly(data = quakes_df, x = ~mag) %>%
+  add_histogram() %>%
+  layout(title = "Distribution of Earthquake Magnitude")
+```
+
+It is clear that the distribution is skewed, so it is worth dividing the earthquake magnitudes into categories.
+
+## 3. New categories based on quantiles
+
+Quantiles can be used to divide data into ranges of values. They determine the percentage of data that falls below a given quantile.
+
+```{r}
+mag_quantiles <- quantile(quakes_df$mag)
+```
+
+Having the magnitude quantiles and knowing the coordinates of earthquake concentration areas based on maps and histograms, it is possible to divide earthquakes according to magnitude category and region.
+
+```{r}
+quakes_processed <- quakes_df %>%
+  mutate(
+    mag_category = case_when(
+      mag < mag_quantiles[2] ~ "1 (weak)",
+      mag >= mag_quantiles[2] & mag < mag_quantiles[3] ~ "2 (moderate)",
+      mag >= mag_quantiles[3] & mag < mag_quantiles[4] ~ "3 (strong)",
+      mag >= mag_quantiles[4] ~ "4 (very strong)"
+    ) %>% factor(ordered = TRUE, levels = c("1 (weak)", "2 (moderate)", "3 (strong)", "4 (very strong)")),
+    
+    region = case_when(
+      lat > -25 & long < 171 ~ "North-West",
+      lat > -25 & long > 171 ~ "North-East",
+      lat <= -25             ~ "South"
+    ) %>% factor()
+  )
+```
+
+Regions are visible in this: 
+
+```{r}
+regions_palette <- colorFactor(palette = c("red", "green", "blue"), domain = quakes_processed$region)
+
+leaflet(quakes_processed) %>%
+  addTiles() %>%
+  addCircleMarkers(lng = ~long,
+                   lat = ~lat,
+                   color = ~regions_palette(region))
+```
+
+The magnitude distribution is as follows:
+
+```{r}
+mag_palette <- colorFactor(c("blue", "lightblue", "pink", "red"), quakes_processed$mag_category)
+
+leaflet(quakes_processed) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    color = ~mag_palette(mag_category),
+    popup = ~paste("Lat:", lat, "<br>Long:", long, "<br>Magnitude:", mag_category)
+  )
+```
+It is clear that strong earthquakes occur in all areas, and the points overlap. Therefore, histograms will be used in further analyses.
+
+## 4. Characteristics of regions
+
+In this section, earthquake characteristics will be assessed by region.
+
+### Magnitude assessment by region 
+
+The graph below allows you to use an animation to show what the earthquake histograms are like in individual regions.
+
+```{r}
+plot_ly(
+  data = quakes_processed,
+  x = ~mag,
+  frame = ~region
+) %>%
+  add_histogram() %>%
+  layout(title = "Distribution of Earthquake Magnitude",
+    yaxis = list(range = c(0, 80))) %>%
+  animation_opts(
+    frame = 2000,   
+    transition = 0, 
+    redraw = TRUE,
+    mode = "immediate"
+  ) %>%
+  animation_button(
+    label = "Play" 
+  ) %>%
+  animation_slider(
+    currentvalue = list(prefix = "Region: ")
+  )
+
+```
+
+It is clear that the northeastern region has the most earthquakes, although in most cases they are not significantly stronger than earthquakes in other regions.
+
+The next graph is a boxplot showing quartiles indicating what percentage of the data falls within what range of values.
+
+```{r}
+plot_ly(
+  data = quakes_processed,
+  x = ~region,
+  y = ~mag
+) %>%
+  add_boxplot()
+
+```
+
+Based on the boplot chart, it can be concluded that earthquakes in the North-West region are generally the most powerful and are stronger than those in the other two regions.
+
+### Magnitude structure in individual regions
+
+In order to assess the distribution of magnitudes in individual regions, a bar chart with the "stack" mode will be used, which will allow determining not only the number of earthquakes in a given region, but also whether they are usually strong or weak.
+
+First, earthquakes of a given category in a given region are counted. This is done using the count function, although group_by and summarise can also be used.
+
+```{r}
+region_mag_counts <- quakes_processed %>%
+  count(region, mag_category, name = "number_of_quakes")
+```
+
+Then a bar chart is drawn with the "stack" mode
+
+```{r}
+plot_ly(
+  data = region_mag_counts,
+  x = ~region,
+  y = ~number_of_quakes,
+  color = ~mag_category
+) %>%
+  add_bars() %>%
+  layout(
+    barmode = "stack",
+    title = "Magnitude Structure within each region"
+  )
+
+```
+
+It is clearly seen that the highest number of earthquakes occurs in the North-East region, but the highest percentage of strongest earthquakes is in the North-West region, which confirms the conclusions from the boxplot.
+
+### Characteristics of magnitude categries
+
+The next step is to assess the magnitude categories. First, ensure that the individual magnitude categories have similar numbers.
+
+```{r}
+mag_counts <- quakes_processed %>%
+  count(mag_category, name = "number_of_quakes")
+```
+
+```{r}
+plot_ly(
+  data = mag_counts,
+  x = ~mag_category,
+  y = ~number_of_quakes
+) %>%
+  add_bars() %>%
+  layout(title = "Number of Earthquakes by Magnitude Category")
+```
+
+
+It is clearly visible that the numbers of individual categories are similar.
+
+The next step is to determine the region where the most strong earthquakes occur through direct comparison.
+
+For this purpose, a graph of the percentage of strong earthquakes in all earthquakes will be developed.
+
+```{r}
+strongest_quakes_pct <- quakes_processed %>%
+  group_by(region) %>%
+  summarise(
+    percent_of_strongest = mean(mag_category == "4 (very strong)") * 100
+  )
+```
+
+
+```{r}
+plot_ly(
+  data = strongest_quakes_pct,
+  x = ~region,
+  y = ~percent_of_strongest,
+  type = "bar"
+) %>%
+  layout(
+    title = "Percentage of Strongest Quakes (Category 4) in Each Region",
+    yaxis = list(title = "% of Strongest Quakes")
+  )
+```
+
+The obtained graph confirms the preliminary conclusions from other graphs - the largest share of earthquakes is in the North-West region.
+
+```{r}
+#| message: false
+#| warning: false
+station_number_stats <- quakes_processed %>%
+  group_by(region, stations) %>%
+  summarise(median_mag = median(mag))
+```
+
+### Earthquake analysis by number of detection stations
+
+To assess the detectability of earthquakes in individual regions, it is necessary to develop a correlation between the region and the detection stations. For an effective presentation, individual earthquakes will be grouped into quantiles.
+
+```{r}
+stations_quantiles <- quantile(quakes_processed$stations)
+```
+
+```{r}
+stations_region_stat <- quakes_processed %>%
+  mutate(
+    stations_category = case_when(
+      stations < stations_quantiles[2] ~ "1 (Few)",
+      stations >= stations_quantiles[2] & stations < stations_quantiles[3] ~ "2 (Moderate-)",
+      stations >= stations_quantiles[3] & stations < stations_quantiles[4] ~ "3 (Moderate+)",
+      stations >= stations_quantiles[4] ~ "4 (A lot)"
+    )
+  ) %>%
+  mutate(
+    stations_category = factor(stations_category, ordered = TRUE)
+  )
+```
+
+Then, a grouping will be used to count how many earthquakes there are in each category.
+
+```{r}
+stations_region_stat_n <- stations_region_stat %>%
+  group_by(stations_category) %>%
+  summarise(number_of =n())
+```
+
+
+```{r}
+plot_ly(
+  data = stations_region_stat_n,
+  x = ~stations_category,
+  y = ~number_of
+) %>%
+  add_bars() %>%
+  layout(
+    title = "Number of rows in stions categories"
+  )
+```
+
+It is clearly seen that the earthquakes were divided into equal ranges based on quantiles.
+
+Heat maps should then be created showing how many stations detect the earthquake in each region.
+
+```{r}
+plot_ly(
+  data = stations_region_stat,
+  x = ~region,
+  y = ~stations_category
+) %>%
+  add_histogram2d() %>%
+  layout(
+    title = "Number of rows in stations categories in region"
+  )
+```
+
+It's clear that earthquakes are detected by the largest number of stations in the Northeast region. Given that earthquakes in this region aren't the most intense, this suggests that the region has the most effective earthquake detection system.
+
+### Assessment of earthquake detectability in individual regions based on the number of stations
+
+To assess the effectiveness of earthquake detection in individual regions, it is necessary to determine the relationship between the number of detection stations and the magnitude in each region. The first approach is a linear graph.
+
+```{r}
+plot_ly(
+  data = station_number_stats,
+  x = ~stations,
+  y = ~median_mag,
+  type = "scatter",
+  mode = "lines",
+  color = ~region
+) %>%
+  layout(title = "Estimation of median magnitude by number of stations - smooth")
+```
+
+It is clearly visible that it is not a good idea to use a line graph for this analysis.
+
+Therefore, the loess method will be used to regress the expected value of the magnitude-number of stations relationship.
+
+First, we create a list of estimates.
+
+```{r}
+region_plots <- list()
+
+for(region_n in levels(station_number_stats$region)) {
+  region_df <- station_number_stats %>% filter(region == region_n)
+  
+  loess_object <- loess(median_mag ~ stations, data = region_df, span = 0.5)
+  
+  prediction_object <- predict(loess_object)
+  
+  region_plots[[region_n]] <- prediction_object
+}
+
+```
+
+Then a function is created to obtain a smoothed estimate for a given region
+
+```{r}
+adding_smooth <- function(region_n){
+  station_number_stats_smooth <- station_number_stats %>%
+    filter(region == region_n) %>%
+    mutate(
+      median_mag = region_plots[[region_n]]
+    )
+  return(station_number_stats_smooth)
+}
+
+```
+
+Then in the loop we get the smoothed magnitude estimation values.
+
+```{r}
+list_smooth <- list()
+for(region_n in levels(station_number_stats$region))
+  {
+    list_smooth[[region_n]] <- adding_smooth(region_n)
+  }
+```
+
+The data is then placed into a tibble for easier presentation.
+
+```{r}
+smooth_drawing_tb <- tibble()
+for(region_n in list_smooth) {
+  smooth_drawing_tb <- smooth_drawing_tb %>% bind_rows(region_n)
+}
+
+```
+
+The last step is to draw a magnitude graph for individual regions depending on the number of stations.
+
+```{r}
+plot_ly(
+  data = smooth_drawing_tb,
+  x = ~stations,
+  y = ~median_mag,
+  type = "scatter",
+  mode = "lines",
+  color = ~region
+) %>%
+  layout(title = "Estimation of median magnitude by number of stations - smooth")
+```
+
+The graph shows that the southern region has too few stations - earthquakes of a given magnitude are detected by fewer stations than earthquakes of the same strength in other regions.
+
+
+### Assessment of earthquake depth in individual regions
+
+To assess earthquake depth in specific regions, a categorical variable representing depth must be created. As before, quantiles will be used for this purpose.
+
+```{r}
+depth_quantiles <- quantile(quakes_processed$depth)
+```
+
+```{r}
+stations_depth_stat <- quakes_processed %>%
+  mutate(
+    depth_category = case_when(
+      depth < depth_quantiles[2] ~ "1 (Shallow)",
+      depth >= depth_quantiles[2] & depth < depth_quantiles[3] ~ "Moderate-",
+      depth >= depth_quantiles[3] & depth < depth_quantiles[4] ~ "Moderate+",
+      depth >= depth_quantiles[4] ~ "2 (Deep)"
+    )
+  ) %>%
+  mutate(
+    depth_category = factor(depth_category, ordered = TRUE)
+  )
+```
+
+Then, two graphs will be developed showing the earthquake depths in particular regions - for weak and strong earthquakes.
+
+```{r}
+weak_quakes_plot <- plot_ly(
+  data = filter(stations_depth_stat, mag_category == "1 (weak)"),
+  x = ~depth_category,
+  y = ~region
+) %>%
+  add_histogram2d() %>%
+  layout(title = "Weak Quakes")
+```
+
+```{r}
+strong_quakes_plot <- plot_ly(
+  data = filter(stations_depth_stat, mag_category == "4 (very strong)"),
+  x = ~depth_category,
+  y = ~region
+) %>%
+  add_histogram2d() %>%
+  layout(title = "Very Strong Quakes")
+```
+
+Then, using the subplot function, one plot is created for strong and weak earthquakes.
+
+```{r}
+subplot(weak_quakes_plot, strong_quakes_plot, nrows = 2, shareY = TRUE, shareX = TRUE, margin = 0.05) %>%
+  layout(
+    title = "Comparison of Distribution for Weak and Very Strong Quakes"
+  )
+```
+
+From the above graphs, it is clear that the North-East region differs significantly from the other two in terms of earthquake depth distribution.
+
+## 5. Summary
+
+It is clear that the Northeast region has the highest number of earthquakes, but these include many weak earthquakes. Furthermore, the earthquake depth structure differs from the other two regions.
+
+The Northwest region is characterized by a moderate number of earthquakes, but very strong earthquakes occur, with a higher percentage than in other regions.
+
+The southern region is characterized by lower earthquake detection efficiency – they are detected by fewer stations than in other regions. This may be due to difficulties locating new stations – there are few islands between Melanesia and New Zealand.
+
+Therefore, the basic recommendation is to effectively warn the Northwest region about earthquakes – they are not frequent, which reduces vigilance, but when they do occur, they can be surprisingly strong. The Northwest region should be assessed for the cause of earthquakes, as their depth structure differs from other regions. The southern region should consider increasing the number of stations, if physically possible.
