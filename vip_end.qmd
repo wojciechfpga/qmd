@@ -1,0 +1,414 @@
+---
+title: "Determining feature importance using the vip::vip function"
+author: "Wojciech L."
+format: html
+editor: visual
+---
+
+## Introduction
+
+Each model has a certain complexity, and the complexity of an ML model increases with the number of input features. In production systems, reducing model complexity is a critical task, as the massive workload of model training or prediction means that reducing the number of features—retaining the most important ones—results in resource savings.
+
+The vip::vip function can be used to determine the importance of model input features. It allows you to plot a graph showing which features are most important for the model, and its results can be verified experimentally or indirectly using statistical tests from the effectsize package, such as Eta Squared.
+
+To simplify development, the model will not undergo detailed evaluation such as ROC, outlier removal, and several other steps typical of ML model development will not be performed.
+
+## 1. Loading libraries and data
+
+```{r}
+#| message: false
+#| warning: false
+library(ggplot2)   
+library(plotly)    
+library(dplyr)       
+library(tidymodels)   
+library(DT)            
+library(tictoc)      
+library(vip)          
+library(effectsize)   
+```
+
+```{r}
+data("diamonds")
+```
+
+```{r}
+diamonds_df <- diamonds
+```
+
+A short look at the histogram of the predicted value (cut) of the model being built will be performed.
+
+```{r}
+plot_ly(
+  data = diamonds_df,
+  x = ~cut
+) %>%
+  add_histogram() %>%
+  layout(
+    title = "Histogram of cut"
+  )
+```
+
+There is clearly a class imbalance, so the Cohen's Kappa parameter, which is robust to class imbalance, should be used in the model evaluation.
+
+## 2. Dividing data
+
+First, the data is divided into training and test sets.
+
+```{r}
+diamonds_split <- initial_split(diamonds_df, strata = cut)
+
+diamonds_training <- training(diamonds_split)
+
+diamonds_testing <- testing(diamonds_split)
+```
+
+## 3. Preprocessing of data
+
+The data recipe is then prepared and can then be implemented using prep and bake.
+
+```{r}
+some_recipe <- recipe(cut ~., data = diamonds_df) %>%
+  step_corr(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+```
+
+A prep instance is then created that can be used for training and test data for final data transformation.
+
+```{r}
+some_recipe_prepared <- prep(some_recipe, training = diamonds_testing) 
+
+testing_processed <- some_recipe_prepared %>%
+  bake(new_data = NULL)
+
+training_processed <- some_recipe_prepared %>%
+  bake(new_data = diamonds_training)
+```
+
+
+## 4. Model instance amd predictions
+
+Next, an instance of the random forest model is created. Randomly selected hyperparameters (but with typical values) are supplemented with an importance parameter, impurity, which defines how feature importance is calculated by averaging the reduction in impurity across nodes.
+
+```{r}
+rf_model <- rand_forest(trees = 100, mtry = 12) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+```
+
+### 4.1. Model fitting
+
+The model will then be trained and its duration will be recorded.
+
+```{r}
+#| message: false
+#| warning: false
+tic("RF")
+fitted_model <- fit(rf_model, cut ~., data = training_processed)
+toc_result <- toc()
+```
+```{r}
+fitting_time <- toc_result$toc - toc_result$tic
+```
+
+The time taken to complete the training.
+
+```{r}
+fitting_time
+```
+### 4.2. Predictions 
+
+To make a prediction, the predict function will be used on the already trained model.
+
+```{r}
+predictions <- predict(fitted_model, new_data = testing_processed)
+```
+
+The prediction results will be collected in a tibble to facilitate their later visualization.
+
+```{r}
+checking_class_df <- testing_processed %>%
+  select(cut) %>%
+  mutate(
+    predictions = predictions$.pred_class
+  )
+```
+
+Then, using the metrics function from the yardstick. package, a data frame with accuracy and kappa metrics is obtained.
+
+```{r}
+metrics_results <- checking_class_df %>%
+  metrics(truth = cut, estimate = predictions)
+```
+
+The received metrics are displayed using the appropriate function from the DT package.
+
+```{r}
+datatable(metrics_results)
+```
+It is clearly visible that the Kappa coefficient is slightly lower than Accuracy, which means that the model may have difficulty predicting less frequently occurring classes.
+
+The next step is to display the confusion matrix, and the coefficient values of this matrix will be calculated using the conf_mat function.
+
+```{r}
+conf_mat_result <- conf_mat(checking_class_df, truth = cut, estimate = predictions)
+```
+
+```{r}
+autoplot(conf_mat_result, type = "heatmap")
+```
+
+It is clear that the predictions are grouped around the diagonal, which is a good sign, but there is a significant imbalance in the number of classes.
+
+## 5. Assessment of the importance of individual features for the model
+
+Using the vip::vip function, the importance of individual entries will be calculated and displayed as a graph.
+
+```{r}
+vip(fitted_model$fit)
+```
+It is clear that the most important features for the model to predict cut to table and depth are: These and other features will be subjected to statistical tests to assess whether statistical methods confirm the significant impact of these features on cut.
+
+The next step is to compare the results with the Eta Squared test from the effectsize package. While the ANOVA test (aov) allows for assessing whether the numerical column influences the categorical column, it does not provide a measure of this influence—how significant it is. The Eta Squared test is used for this purpose.
+
+Due to the negligible effect of other categorical variables on the model result, tests such as chi-square will not be conducted to assess the effect of other categorical columns on the cut column.
+
+First, an empty tibble is created, which will later be filled with data.
+
+```{r}
+effects <-tibble(
+  parameter = character(),
+  impact = numeric()
+)
+```
+
+Then, calculations will be performed in a loop on the numerical columns, allowing the assessment of the influence of a given column on the cut.
+
+```{r}
+diamonds_df_numeric <- diamonds_df %>%
+  select(where(is.numeric))
+```
+
+
+```{r}
+#| message: false
+#| warning: false
+for(column in colnames(diamonds_df_numeric))
+{
+  t_compare <- diamonds_df[[column]]
+  aov_result <- aov(t_compare ~ diamonds_df$cut)
+  effect_size_result <- effectsize::eta_squared(aov_result)
+  tempolary_tibble <- tibble(
+    parameter = column,
+    impact = effect_size_result$Eta2
+  )
+  
+  effects <- effects %>%
+    bind_rows(tempolary_tibble)
+}
+```
+
+The cut impact data is then sorted.
+
+```{r}
+effects <- effects %>%
+  arrange(impact)
+```
+
+Cut impact data is being prepared for display.
+
+```{r}
+effects <- effects %>%
+  mutate(parameter = reorder(parameter, rev(impact)))
+```
+
+The data is then displayed using the DT package.
+
+```{r}
+datatable(effects)
+```
+
+The data displayed in the table confirms what the graph from the vip::vip function showed. The test results will also be displayed using a bar chart.
+
+```{r}
+plot_ly(
+  data = effects,
+  x = ~parameter,
+  y = ~impact
+) %>%
+  add_bars() %>%
+  layout(
+    title = "The influence of input parameters on the cut - Eta Squared result"
+  )
+```
+
+It is clearly visible that the bar chart confirms the observations obtained from the vip:vip function - table and depth have the greatest impact on cut.
+
+## 6. Comparassion of model only with important features
+
+Following the same procedure as for the full-feature model, a model with the most important features will be created for comparison to the full-feature model. First, the relevant features must be selected.
+
+```{r}
+diamonds_df_if <- diamonds %>% select(cut, table, depth)
+```
+
+Then, following the same procedure, a table of Cohen's Kappa and Accuracy results for the model will be obtained.
+
+```{r}
+#| include: false
+diamonds_split_if <- initial_split(diamonds_df_if, strata = cut)
+
+diamonds_training_if <- training(diamonds_split)
+
+diamonds_testing_if <- testing(diamonds_split)
+```
+
+```{r}
+#| include: false
+some_recipe_if <- recipe(cut ~., data = diamonds_df_if) %>%
+  step_normalize(all_numeric_predictors()) 
+```
+
+
+```{r}
+#| include: false
+some_recipe_prepared <- prep(some_recipe_if, training = diamonds_testing_if) 
+
+testing_processed_if <- some_recipe_prepared %>%
+  bake(new_data = NULL)
+
+training_processed_if <- some_recipe_prepared %>%
+  bake(new_data = diamonds_training_if)
+```
+
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+tic("RF")
+fitted_model_if <- fit(rf_model, cut ~., data = training_processed_if)
+toc_result_if <- toc()
+```
+```{r}
+#| include: false
+fitting_time_if <- toc_result_if$toc - toc_result_if$tic
+```
+
+
+```{r}
+#| include: false
+predictions_if <- predict(fitted_model_if, new_data = testing_processed_if)
+```
+
+
+```{r}
+#| include: false
+checking_class_df <- testing_processed_if %>%
+  select(cut) %>%
+  mutate(
+    predictions = predictions_if$.pred_class
+  )
+```
+
+
+
+```{r}
+#| include: false
+metrics_results_if <- checking_class_df %>%
+  metrics(truth = cut, estimate = predictions)
+```
+
+The received metrics are displayed using the appropriate function from the DT package.
+
+```{r}
+#| echo: false
+datatable(metrics_results_if)
+```
+
+Then, the obtained metrics should be compared with the metrics of the model with all features.
+
+Then both metric tables are joined using left_join
+
+```{r}
+metrics_combined <- metrics_results %>%
+  rename(estimate_original = .estimate) %>%
+  left_join(
+    metrics_results_if %>%
+      rename(estimate_if = .estimate),
+    by = c(".metric", ".estimator")
+  ) %>% select(-.estimator)
+```
+
+Then the data format is converted to long.
+
+```{r}
+metrics_combined_longer <- metrics_combined %>% pivot_longer(cols = starts_with("estimate"),
+               names_to = "estimation_type",
+               values_to = "value")
+```
+
+To avoid visualization problems, character types are converted to factor.
+
+```{r}
+metrics_combined_wider_typed <- metrics_combined_longer %>%
+  mutate(
+    estimation_type = factor(estimation_type),
+    .metric = factor(.metric)
+  )
+```
+
+Finally, the results can be visualized using the plotly package.
+
+```{r}
+plot_ly(
+  data = metrics_combined_wider_typed,
+  x = ~estimation_type,
+  y = ~.metric,
+  z = ~value
+) %>%
+  add_heatmap() %>%
+  layout(
+    title = "Comparassion of metrics in model",
+    xaxis = list(title = "Model type"),
+    yaxis = list(title = "Metric")
+  )
+```
+
+It is clearly visible that the metrics in both models do not differ much from each other.
+
+
+The next step is to compare the model training time with all features and only with the most important features.
+
+```{r}
+fitting_time_tb <- tibble(
+time = c(fitting_time, fitting_time_if),
+model = c("All features model", "Most important features model")
+)
+```
+
+```{r}
+plot_ly(
+  data = fitting_time_tb,
+  x = ~model,
+  y= ~time
+) %>%
+  add_bars() %>%
+  layout(
+    title = "Comparison of models with all features and only the most important features"
+  )
+```
+
+It is clearly visible that the simplified model has a much shorter training time than the one with all features.
+
+## 7. Summary
+
+The obtained data clearly indicate that the most important features for the cut prediction model are table and depth.
+
+This is confirmed by the graph of the vip::vip function and the results of the Eta Squared test.
+
+It should be emphasized that for subsequent positions, discrepancies appear – vip::vip indicates price as the third most important feature, while Eta Squared indicates carat.
+
+The described method can be used to reduce the model's dimensions by removing the least important features to simplify training or prediction. In the described case, these would be categorical columns other than cut, as well as columns related to diamond dimensions – x, y, and z.
+
+The most important finding is that the experiment with removing irrelevant columns from the data resulted in significantly shorter training times and only slightly lower performance. This supports the idea that less relevant model entries can be removed to improve performance with very little degradation in model efficiency.
