@@ -1,0 +1,398 @@
+---
+title: "Analysis of the influence of features on the cut and color of diamonds."
+author: "Wojciech L."
+format: html
+editor: visual
+---
+
+## Introduction
+
+The purpose of this paper is to determine which characteristics significantly influence a diamond's cut and color—what characteristics of a diamond influence a diamond's cut and clarity.
+
+First, an analysis will be conducted using a series of statistical tests for individual columns of the diamond collection.
+
+Then, the test results will indicate which characteristics should have the greatest impact on cut/clarity.
+
+Finally, an analysis will be conducted to confirm or refute the hypothesis based on the tests that another characteristic influences cut/color. If the graphs confirm the hypothesis, it will be necessary to determine the extent and effect of the other characteristic's influence on cut/clarity.
+
+## 1. Loading libraries and data
+
+```{r}
+#| message: false
+#| warning: false
+library(ggplot2)
+library(leaflet)
+library(plotly)
+library(dplyr)
+library(tidyr)
+library(corrplot)
+library(lsr)
+library(tidymodels)
+library(doParallel)
+library(tictoc)
+library(effectsize)
+library(broom)
+library(DT)
+```
+
+```{r}
+data("diamonds")
+```
+
+```{r}
+diamonds_df <- diamonds
+```
+
+
+## 2. Function to analyze influence
+
+Because cut and color are categorical columns, an analysis of the effects on these variables will be conducted—ANOVA for numerical variables and Chi-square for other categorical variables. Cramer's V or Eta Squared tests will then be performed, depending on whether the column is numerical or categorical, to determine the extent of any potential effects on cut/color. To maintain the DRY principle, a function has been developed that allows the use of analytical code grouping test results into tibbles for each categorical column.
+
+```{r}
+analyze_by_category <- function(data, cat_var, num_vars = NULL, cat_vars = NULL) {
+  results <- list()
+  
+  if (!is.null(num_vars)) {
+    anova_res <- purrr::map_dfr(num_vars, function(num_var) {
+      formula <- as.formula(paste(num_var, "~", cat_var))
+      fit <- aov(formula, data = data)
+      tidy_fit <- broom::tidy(fit)
+      eta <- effectsize::eta_squared(fit, partial = FALSE)
+      
+      tibble(
+        response = num_var,
+        test = "ANOVA",
+        F_value = tidy_fit$statistic[1],
+        p_value = tidy_fit$p.value[1],
+        eta2 = eta$Eta2[1]
+      )
+    })
+    results <- append(results, list(anova_res))
+  }
+  
+  if (!is.null(cat_vars)) {
+    chisq_res <- purrr::map_dfr(cat_vars, function(other_cat) {
+      tab <- table(data[[cat_var]], data[[other_cat]])
+      chi <- chisq.test(tab)
+      v <- effectsize::cramers_v(chi)
+      
+      tibble(
+        response = other_cat,
+        test = "Chi-sq",
+        X2 = chi$statistic,
+        p_value = chi$p.value,
+        cramers_v = v$Cramers_v[1]
+      )
+    })
+    results <- append(results, list(chisq_res))
+  }
+  
+  bind_rows(results)
+}
+```
+
+## 3. Analysis of the influence of other features on color
+
+In order to analyze the influence of other factors, the function developed in the previous chapter will be called.
+
+```{r}
+res_color <- analyze_by_category(
+  data = diamonds_df,
+  cat_var = "color",
+  num_vars = c("depth", "table", "price", "carat"),
+  cat_vars = c("cut", "clarity")
+)
+```
+
+The obtained result can be easily displayed in a readable form using the DT package.
+
+```{r}
+datatable(res_color)
+```
+The Eta-Squared test result allows us to conclude that the color is most influenced by the diamond's mass - carat.
+
+Therefore, in the next part of the chapter the influence of carat on cut will be analyzed, it will be determined how carat influences cut.
+
+To perform the analysis, the numerical column of carat must be divided into equally sized fragments. Quantiles are used for this purpose.
+
+```{r}
+carat_qt <- quantile(diamonds_df$carat, probs = seq(0.1, 0.9, by = 0.1))
+```
+
+Then the diamond data set is modified so that each diamond is assigned the quanta of the carat to which it belongs.
+
+```{r}
+df_carat_qt <- diamonds_df %>%
+  mutate(
+    carat_qt = case_when(
+      carat < carat_qt[1] ~ 1,
+      carat >= carat_qt[1] & carat < carat_qt[2] ~ 2,
+      carat >= carat_qt[2] & carat < carat_qt[3] ~ 3,
+      carat >= carat_qt[3] & carat < carat_qt[4] ~ 4,
+      carat >= carat_qt[4] & carat < carat_qt[5] ~ 5,
+      carat >= carat_qt[5] & carat < carat_qt[6] ~ 6,
+      carat >= carat_qt[6] & carat < carat_qt[7] ~ 7,
+      carat >= carat_qt[7] & carat < carat_qt[8] ~ 8,
+      carat >= carat_qt[8] & carat < carat_qt[9] ~ 9,
+      carat >= carat_qt[9] ~ 10
+    )
+  ) %>%
+  mutate(carat_qt = factor(carat_qt, ordered = TRUE))
+
+```
+
+The carat quantile statistic is then calculated and a graph showing the numbers in each quantile is displayed.
+
+```{r}
+#| message: false
+#| warning: false
+sum_carat_qt <- df_carat_qt %>%
+  group_by(carat_qt) %>%
+  summarise(n = n())
+
+```
+
+```{r}
+plot_ly(
+  data = sum_carat_qt,
+  x = ~carat_qt,
+  y = ~n
+) %>%
+  add_bars()
+```
+
+As you can see, the counts are not equal, but there are no quantiles with extremely large or small counts.
+
+The first step in analyzing the effect of diamond carat weight on cut is to show a 2D histogram illustrating these values.
+
+```{r}
+plot_ly(
+  data = df_carat_qt,
+  x = ~carat_qt,
+  y = ~color
+) %>%
+  add_histogram2d() %>%
+  layout(
+    title = "Histogram 2D carat quantile - color class"
+  )
+```
+
+As you can see, as the diamond's mass increases, so does its color grade. However, this effect is uneven, with significant deviations from the resulting, blurred diagonal.
+
+However, the chart shows that most medium-weight, medium-sized, or large diamonds are E-G in color. Many heavy diamonds are H-I in color, and very few lightweight diamonds are H-J in color.
+
+To obtain a more complete picture of how the mass of a diamond affects its color, a 2D graph of the percentage share of individual colors in the mass quantiles should be obtained.
+
+```{r}
+sum_color <- df_carat_qt %>%
+  group_by(color) %>%
+  summarise(n = n())
+```
+
+Then we group the diamonds by color and mass quantiles.
+
+```{r}
+#| message: false
+#| warning: false
+sum_carat_qt_pct <- df_carat_qt %>%
+  group_by(carat_qt, color) %>%
+  summarise(pct = n())
+```
+
+To copy the value of the obtained tibble, an assignment is made.
+
+```{r}
+sum_carat_qt_pct_rdy <- sum_carat_qt_pct
+```
+
+Then an empty table is created with the results, which will be populated in the loop.
+
+```{r}
+color_qt_pct_tb <- sum_carat_qt_pct_rdy %>% slice(0)
+```
+
+Then, using a loop, the percentage share of each color in the mass quantiles is assigned.
+
+```{r}
+#| include: false
+for (clr in levels(sum_carat_qt_pct$color)) {
+  df_clr <- sum_color %>% filter(color == clr)
+  n_clr <- df_clr$n
+  
+  sum_carat_qt_pct_rdy_new <- sum_carat_qt_pct_rdy %>%
+    filter(color == clr) %>%
+    mutate(pct = round((pct / n_clr) * 100, 2))
+  
+  color_qt_pct_tb <- color_qt_pct_tb %>%
+    bind_rows(sum_carat_qt_pct_rdy_new)
+}
+
+```
+
+```{r}
+#| eval: false
+#| include: true
+
+for (clr in levels(sum_carat_qt_pct$color)) {
+  df_clr <- sum_color %>% filter(color == clr)
+  n_clr <- df_clr$n
+  
+  sum_carat_qt_pct_rdy_new <- sum_carat_qt_pct_rdy %>%
+    filter(color == clr) %>%
+    mutate(pct = round((pct / n_clr) * 100, 2))
+  
+  color_qt_pct_tb <- color_qt_pct_tb %>%
+    bind_rows(sum_carat_qt_pct_rdy_new)
+}
+
+```
+
+The obtained results are sorted.
+
+```{r}
+color_qt_pct_tb <- color_qt_pct_tb %>%
+  arrange(color)
+```
+
+The resulting tibble allows for easy visualization in the form of a heatmap.
+
+```{r}
+plot_ly(
+  data = color_qt_pct_tb,
+  x = ~carat_qt,
+  y = ~color,
+  z = ~pct
+) %>%
+  add_heatmap() %>%
+  layout(
+    title = "The proportion of quantiles of diamond mass in the number of diamonds of specific colors."
+  )
+```
+
+It's clear that colors I and J are used primarily in the heaviest diamonds. Colors E and D are used primarily in lighter diamonds.
+
+## 4. Analysis of the impact of other features on the cut
+
+To evaluate the impact of individual columns on the cut, a function created at the beginning of the study is called.
+
+```{r}
+diamonds_results_cut <- analyze_by_category(
+  data = diamonds_df,
+  cat_var = "cut",
+  num_vars = c("depth", "table", "price", "carat"),
+  cat_vars = c("clarity", "color")
+)
+```
+
+```{r}
+datatable(diamonds_results_cut)
+```
+
+It is clearly visible that the table has the greatest influence on the cutting of the diamond.
+
+Due to the fact that the table is numerical in nature, it is advisable to transform it into quantiles - a categorical variable.
+
+```{r}
+table_quantiles <- quantile(diamonds_df$table, probs = seq(0, 1, by = 0.1))
+table_quantiles <- unique(table_quantiles)
+```
+
+To simplify the code, the cut function will be used to assign rows to the quantile table.
+
+```{r}
+diamonds_df_with_quantile_table <- diamonds_df %>%
+  mutate(
+    table_quantile = cut(
+      table,
+      breaks = table_quantiles,
+      include.lowest = TRUE,
+      labels = FALSE,
+      right = FALSE
+    )
+  ) %>%
+  mutate(
+    table_quantile = factor(table_quantile, ordered = TRUE)
+  )
+```
+
+To assess whether the obtained quantiles have correctly divided the set, a bar chart should be displayed.
+
+```{r}
+plot_ly(
+  data = diamonds_df_with_quantile_table,
+  x = ~table_quantile
+) %>%
+  add_histogram()
+```
+
+As before, the first step to be performed is a two-dimensional histogram specifying what number of diamonds with a given cut class belong to which quantiles of the table.
+
+```{r}
+plot_ly(
+  data = diamonds_df_with_quantile_table,
+  x = ~cut,
+  y = ~table_quantile
+) %>%
+  add_histogram2d() %>%
+  layout(
+    title = "Histogram 2D table quantile - cutting class"
+  )
+```
+
+It's clear that there are many diamonds with a Perfect cut that have a low table value. Few diamonds with a Ideal cut have a high table value.
+
+The situation is completely different in the case of the Premium cut - most diamonds there have a high table value.
+
+In order to analyze the impact of table on diamonds with rare cuts such as Fair, it is necessary to develop a heatmap illustrating the percentage share of a given table quantile in the number of diamonds with a particular cut class.
+
+For this purpose, a data frame is created, specifying the number of diamonds with a given table quantile and cut. Additionally, another statistic is generated, indicating the number of diamonds with a given cut grade and table quantile.
+
+The obtained statistics allow for easy determination of the percentage share of table quantiles in individual cutting classes.
+
+```{r}
+diamonds_df_table_stats <- diamonds_df_with_quantile_table %>%
+  group_by(table_quantile) %>%
+  mutate(number_of_table = n()) %>%
+  ungroup()
+
+diamonds_df_cut_stats <- diamonds_df_with_quantile_table %>%
+  group_by(cut) %>%
+  mutate(number_of_cut = n()) %>%
+  ungroup()
+
+diamonds_df_cut_table_stats <- diamonds_df_with_quantile_table %>%
+  group_by(cut, table_quantile) %>%
+  mutate(number_of_cut_of_table = n()) %>%
+  ungroup()
+
+
+diamonds_df_percent_cut_table_stats <- diamonds_df_cut_stats %>%
+  select(cut, table_quantile, number_of_cut) %>%
+  bind_cols(diamonds_df_cut_table_stats %>% select(number_of_cut_of_table)) %>%
+  distinct() %>%
+  mutate(number_of_percent = round(number_of_cut_of_table/number_of_cut, 2)*100)
+```
+
+The obtained results can be easily displayed in the form of a heatmap.
+
+```{r}
+plot_ly(
+  data = diamonds_df_percent_cut_table_stats,
+  x = ~cut,
+  y = ~table_quantile,
+  z = ~number_of_percent
+) %>%
+  add_heatmap() %>%
+  layout(
+    title = "Table quantile - cutting class percent relation"
+  )
+```
+
+While common grades like Ideal and Premium were analyzed on the histogram alone, rare grades like Fair can only now be analyzed. It's clear that diamonds with lower grades—Fair and Good—usually have high table values.
+
+## 5. Summary
+
+Most of medium-weight or large diamonds are usually of high valuable colors. Very few lightweight diamonds have high valuable (like H-J)  colors.This knowledge enables the optimization of lighting and display equipment so that the shelves for heavy diamonds have lighting and decorations appropriate to the dominant color.
+
+Diamonds with high cut grades typically have a low table value (although the Premium cut has a high table despite being valued). Diamonds with low cut grades typically have high table values.This knowledge can be used to pre-define a table for a batch of diamonds where diamonds of a specific cut class predominate in order to prepare the warehouse accordingly.
+
