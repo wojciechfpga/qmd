@@ -9,6 +9,8 @@ editor: visual
 
 The purpose of this paper is to determine which characteristics significantly influence a diamond's cut and color—what characteristics of a diamond influence a diamond's cut and clarity.
 
+In the case of cut, it is expected that the values of which factors are concentrated in diamonds of a given cut class in order to optimize the distribution of goods in the warehouse. For example, a warehouse manager complains that diamonds of a given cut class are "scattered" among diamonds of different characteristics and wants to group them for easier access. In the case of color, display staff complain about difficulties in optimizing shelf decoration to best display the diamond's color.
+
 First, an analysis will be conducted using a series of statistical tests for individual columns of the diamond collection.
 
 Then, the test results will indicate which characteristics should have the greatest impact on cut/clarity.
@@ -20,19 +22,14 @@ Finally, an analysis will be conducted to confirm or refute the hypothesis based
 ```{r}
 #| message: false
 #| warning: false
-library(ggplot2)
-library(leaflet)
-library(plotly)
-library(dplyr)
-library(tidyr)
-library(corrplot)
-library(lsr)
-library(tidymodels)
-library(doParallel)
-library(tictoc)
-library(effectsize)
-library(broom)
-library(DT)
+library(ggplot2) 
+library(plotly) 
+library(dplyr)   
+library(tidyr)   
+library(effectsize) 
+library(broom)   
+library(DT)    
+library(purrr)
 ```
 
 ```{r}
