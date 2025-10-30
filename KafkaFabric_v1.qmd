@@ -209,6 +209,10 @@ LEFT JOIN TopRegion AS r
 
 The table in the lakehouse to which the data from the above query is saved can be used for statistical analysis of the data in subsequent time fragments.
 
+Example analysis of data - in PySpark - obtained from this query and saved to the Delta Lake table:
+
+[Kafka Data Analysis](https://github.com/wojciechfpga/LakehouseDataAnalysis/blob/main/kafka_data_analysis.ipynb)
+
 ## 4.1. Real - Time Dashboard
 
 To create a Real-Time Dashboard you must have a data source in the form of a table in a KQL database.
