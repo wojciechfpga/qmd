@@ -1,5 +1,5 @@
 ---
-title: "Kappa Data Architecture example with Airflow, dbt, ClickHouse, Kafka with an automatic report generator in Pandas and Seaborn that automatically sends reports to Jira."
+title: "Data Architecture example with Airflow, dbt, ClickHouse, Kafka with an automatic report generator in Pandas and Seaborn that automatically sends reports to Jira."
 author: "Wojciech L"
 format: html
 editor: visual
