@@ -1,0 +1,120 @@
+---
+title: "Calculating the number of clusters and distances from centroids for the KMEANS model in fraud detection"
+author: "Wojciech L."
+format: html
+editor: visual
+---
+
+## Introduction
+
+This book will present a method for finding the correct number of clusters and distances from centroids for the KMEANS anti-fraud model.
+
+Data loaded to this notebook is set of valid transactions. The goal of the analysis is to obtain KMEANS parameters that will allow for the detection of transactions that deviate from the dataset loaded here.
+
+## 1. Loading data and libraries
+
+```{r}
+#| message: false
+#| warning: false
+library(dplyr)     
+library(tidymodels) 
+library(DT)         
+library(cluster)
+```
+
+
+```{r}
+transactions_df = as_tibble(read.csv("synthetic_transactions.csv"))
+df_original <- transactions_df
+```
+
+Quick preview:
+
+```{r}
+datatable(transactions_df)
+```
+
+
+## 2. Converting data to numeric form
+
+```{r}
+transactions_df <- recipe(price ~.,data = transactions_df) %>%
+  step_range(all_numeric(), min = 0, max = 1) %>%
+  prep() %>%
+  bake(new_data = NULL)
+```
+
+## 3. Calculating the number of clusters
+
+For a predetermined number of clusters—from 1 to 10—a silhouette is calculated. This involves calculating how well a point fits into a given cluster compared to other clusters. The result is then averaged across all points.
+
+```{r}
+#| message: false
+#| warning: false
+
+sil_width <- numeric(9) 
+
+for (k in 2:10) {
+  km <- kmeans(transactions_df, centers = k, nstart = 25)
+  ss <- silhouette(km$cluster, dist(df_original))
+  sil_width[k - 1] <- mean(ss[, 3]) 
+}
+```
+
+Once the values have been calculated, it is possible to draw a graph.
+
+```{r}
+plot(2:10, sil_width, type = "b", 
+     xlab = "Number of clusters", 
+     ylab = "Mean Cof. of Silhouette")
+```
+
+The graph shows that the best number of clusters for a given set is three.
+
+## 4. Calculating the minimum distance from centroids
+
+For a point to not be considered an outlier—in this case, a suspicious transaction—it must lie less than the minimum distance (threshold) from the nearest centroid.
+
+First, an instance of the kmeans model must be established.
+
+```{r}
+km_model <- kmeans(transactions_df, centers = 3, nstart = 25)
+```
+
+Then a function is defined to calculate the distance from the nearest centroid.
+
+```{r}
+min_dist_to_centroid <- function(x, centers) {
+  apply(centers, 1, function(c) sqrt(sum((x - c)^2))) |> min()
+}
+```
+
+The minimum distances to the centroids are then calculated.
+
+```{r}
+distances <- apply(transactions_df, 1, min_dist_to_centroid, centers = km_model$centers)
+```
+
+The maximum value from the centroid is then obtained. It is assumed that all values ​​in the set are valid transactions, so anything further from the value obtained here will be an outlier, a suspicious transaction.
+
+```{r}
+max_distance <- max(distances)
+cat("Max distance to centroid:", round(max_distance, 4), "\n")
+```
+
+
+```{r}
+hist(distances, breaks = 50, main = "Distribution of distance from nearest centroid", xlab = "Distance")
+abline(v = max_distance, col = "red", lwd = 2)
+```
+It is clearly visible that the greatest distance oscillates around 0.63
+
+## 5. Summary
+
+- The distance obtained above which transactions should be considered suspicious is 0.63
+
+- The optimal number of clusters is three
+
+- Please note that not every transaction with a distance above 0.63 is a scam - it may simply be unusual
+
+- The above analysis is static. To train the model on-the-fly and obtain the specified KMEANS parameters based on the current data, you should use environments like Kafka or Flink and use Java/Scala/Python to obtain dynamically changing cluster numbers and distances from centroids.
