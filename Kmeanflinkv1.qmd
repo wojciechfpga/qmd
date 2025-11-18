@@ -1,0 +1,345 @@
+---
+title: "Implementing messeges counter and KMEANS model in a Kafka Stream using Scala - Flink ML"
+author: "Wojciech L"
+format: html
+editor: visual
+---
+
+```{python}
+#| eval: false
+#| include: true
+
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+    networks:
+      - kafka-net
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kafka-net
+    restart: unless-stopped
+
+  flink-jobmanager:
+    build: ./flink_job
+    container_name: jobmanager
+    hostname: jobmanager
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8081"
+    environment:
+      JOB_MANAGER_RPC_ADDRESS: jobmanager
+      JVM_ARGS: --add-opens=java.base/sun.net.util=ALL-UNNAMED
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 1
+        rest.bind-address: 0.0.0.0
+        rest.address: jobmanager
+
+    command: >
+      bash -c "/opt/flink/bin/jobmanager.sh start-foreground & sleep 10 && bash /opt/flink_job/run_jobs.sh"
+    volumes:
+      - ./flink_job:/opt/flink_job
+      - ./flink_job/flink-conf.yaml:/opt/flink/conf/flink-conf.yaml 
+    networks:
+      - kafka-net
+    restart: unless-stopped
+
+  flink-taskmanager:
+    build: ./flink_job
+    container_name: taskmanager
+    depends_on:
+      - flink-jobmanager
+    environment:
+      JOB_MANAGER_RPC_ADDRESS: jobmanager
+      JVM_ARGS: --add-opens=java.base/sun.net.util=ALL-UNNAMED
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 1
+        rest.bind-address: 0.0.0.0
+        rest.address: jobmanager
+
+
+    command: ["/opt/flink/bin/taskmanager.sh", "start-foreground"]
+    volumes:
+      - ./flink_job:/opt/flink_job
+      - ./flink_job/flink-conf.yaml:/opt/flink/conf/flink-conf.yaml 
+    networks:
+      - kafka-net
+    restart: unless-stopped
+
+  django:
+    build: ./diamonds_shop
+    depends_on:
+      - kafka
+    ports:
+      - "8001:8000"
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    command: python manage.py runserver 0.0.0.0:8000
+    volumes:
+      - ./diamonds_shop:/app
+    networks:
+      - kafka-net
+    restart: unless-stopped
+
+  kafka-consumer:
+    build: ./consumers
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    command: python consumer.py
+    volumes:
+      - ./consumers:/app
+    networks:
+      - kafka-net
+    restart: unless-stopped
+
+  kafka-messages-number-consumer:
+    build: ./consumers
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    command: python consumer_messages_number.py
+    volumes:
+      - ./consumers:/app
+    networks:
+      - kafka-net
+    restart: unless-stopped
+
+  kafka-fraud-consumer:
+    build: ./consumers
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    command: python consumer_suspicion_of_fraud.py
+    volumes:
+      - ./consumers:/app
+    networks:
+      - kafka-net
+    restart: unless-stopped
+
+
+networks:
+  kafka-net:
+    name: kafka-net
+
+```
+
+
+
+```{python}
+#| eval: false
+#| include: true
+package com.flinkmodel.job
+
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment
+import org.slf4j.LoggerFactory
+import com.flinkmodel.io._
+import com.flinkmodel.features._
+import com.flinkmodel.training._
+
+import com.typesafe.config.ConfigFactory
+
+object TrainModelJob {
+  val loggerObj = LoggerFactory.getLogger(getClass)
+
+  def main(args: Array[String]): Unit = {
+    val config = ConfigFactory.load()
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    val tEnv = StreamTableEnvironment.create(env)
+
+    val dataPath = config.getString("flink.data-path")
+    val modelDirectory = config.getString("flink.model-directory")
+
+    val transactions = DataLoader.loadTransactions(tEnv, dataPath)
+    val withFeatures = FeaturePreprocessor.assembleFeatures(transactions, tEnv)
+    val (scaled, minVals, maxVals) = FeaturePreprocessor.scaleFeatures(withFeatures)
+    val centers = KMeansTrainer.train(scaled)
+
+    ModelSaver.saveCenters(modelDirectory, centers)
+    ModelSaver.saveScaler(modelDirectory, minVals, maxVals)
+
+    loggerObj.info("Success of training")
+  }
+}
+
+```
+
+
+
+```{python}
+#| eval: false
+#| include: true
+package com.flinkmodel.training
+
+import org.apache.flink.ml.clustering.kmeans.KMeans
+import org.apache.flink.ml.linalg.DenseVector
+
+object KMeansTrainer {
+  def train(table: org.apache.flink.table.api.Table): Array[Array[Double]] = {
+    val kmeans = new KMeans().setK(3).setFeaturesCol("scaled_features")
+    val model = kmeans.fit(table)
+    val modelData = model.getModelData()(0)
+    val iter = modelData.execute().collect()
+    val centers = scala.collection.mutable.ArrayBuffer[Array[Double]]()
+    while (iter.hasNext) {
+      val row = iter.next()
+      val vectors = row.getField(0).asInstanceOf[Array[DenseVector]]
+      vectors.foreach(v => centers += v.toArray)
+    }
+    centers.toArray
+  }
+}
+
+```
+
+
+
+
+```{python}
+#| eval: false
+#| include: true
+package com.flinkfraud.job
+import scala.collection.JavaConverters._
+import com.flinkfraud.config.JobConfig
+import com.flinkfraud.model.{Transaction, FeatureScaler}
+import com.flinkfraud.parser.TransactionParser
+import com.flinkfraud.fraud.WindowFraudCollector
+
+import org.apache.flink.api.common.serialization.SimpleStringSchema
+import org.apache.flink.api.common.eventtime.WatermarkStrategy
+import org.apache.flink.api.common.typeinfo.TypeInformation
+import org.apache.flink.connector.kafka.source.KafkaSource
+import org.apache.flink.connector.kafka.sink.{KafkaRecordSerializationSchema, KafkaSink}
+import org.apache.flink.connector.base.DeliveryGuarantee
+import org.apache.flink.streaming.api.scala._
+import org.apache.flink.streaming.api.windowing.time.Time
+import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows
+
+/**
+  * Flink streaming:
+  *  - Detecting transactions with high probability of fraud
+  *  - Counting incoming messages
+  */
+object FlinkStreamingJob {
+
+  def main(args: Array[String]): Unit = {
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    env.setParallelism(1)
+
+    val config = JobConfig.load()
+
+    val centers = scala.io.Source
+      .fromFile(config.modelCentersPath)
+      .getLines()
+      .map(_.split(",").map(_.toDouble))
+      .toArray
+
+    val scaler = FeatureScaler.load(config.scalerPath)
+
+    implicit val stringTypeInfo: TypeInformation[String] = TypeInformation.of(classOf[String])
+    val source = KafkaSource.builder[String]()
+      .setBootstrapServers(config.kafkaBootstrap)
+      .setTopics(config.kafkaTopics.asJava)
+      .setGroupId("flink-fraud-detector")
+      .setValueOnlyDeserializer(new SimpleStringSchema())
+      .build()
+
+    val inputStream: DataStream[String] =
+      env.fromSource(source, WatermarkStrategy.noWatermarks[String](), "KafkaSource")(stringTypeInfo)
+
+    val sinkFraud = KafkaSink.builder[String]()
+      .setBootstrapServers(config.kafkaBootstrap)
+      .setRecordSerializer(
+        KafkaRecordSerializationSchema.builder()
+          .setTopic(config.kafkaFraudTopic)
+          .setValueSerializationSchema(new SimpleStringSchema())
+          .build()
+      )
+      .setDeliverGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+      .build()
+
+    val sinkCount = KafkaSink.builder[String]()
+      .setBootstrapServers(config.kafkaBootstrap)
+      .setRecordSerializer(
+        KafkaRecordSerializationSchema.builder()
+          .setTopic(config.kafkaCountTopic)
+          .setValueSerializationSchema(new SimpleStringSchema())
+          .build()
+      )
+      .setDeliverGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+      .build()
+
+    implicit val intTypeInfo: TypeInformation[Int] = TypeInformation.of(classOf[Int])
+    inputStream
+      .map(_ => 1)
+       .windowAll(TumblingProcessingTimeWindows.of(Time.minutes(5))
+        .asInstanceOf[org.apache.flink.streaming.api.windowing.assigners.WindowAssigner[_ >: Int, org.apache.flink.streaming.api.windowing.windows.TimeWindow]])
+      .reduce(_ + _)
+      .map(_.toString)
+      .sinkTo(sinkCount)
+
+    val transactionStream = inputStream
+      .filter(_.contains("Zakupiono diament"))
+      .map(new TransactionParser)
+
+    val fraudCollector = new WindowFraudCollector(
+      centers,
+      scaler,
+      config.threshold,
+      config.logPath
+    )
+
+    transactionStream
+      .assignTimestampsAndWatermarks(WatermarkStrategy.noWatermarks[Transaction]())
+      .windowAll(TumblingProcessingTimeWindows.of(Time.minutes(4)))
+      .process(fraudCollector)
+      .sinkTo(sinkFraud)
+
+    env.execute("Flink Fraud Detection Job")
+  }
+}
+
+```
+
+```{bash}
+sbt clean compile assembly && \
+flink run -c com.flinkmodel.job.TrainModelJob /opt/flink_job/target/scala-2.12/flinkscalajob-uber.jar && \
+flink run -c com.flinkfraud.job.FlinkStreamingJob /opt/flink_job/target/scala-2.12/flinkscalajob-uber.jar
+
+```
+
